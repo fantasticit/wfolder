@@ -35,6 +35,7 @@ struct FileOperationResult: Sendable {
 
     var revealed: [URL] = []
     var failures: [Failure] = []
+    var relocations: [FileRelocation] = []
 
     nonisolated static func apply(to sources: [URL], _ operation: (URL) throws -> URL?) -> Self {
         var result = Self()
@@ -536,23 +537,19 @@ final class BrowserModel {
 
     var canRenameItems: Bool { !busy && !session.isTransferring && !loading && loadError == nil }
     var canModifyDirectory: Bool { !isStash && canRenameItems }
-    var canPaste: Bool { canModifyDirectory && session.canPaste }
+    var canQueueTransfer: Bool { !isStash && !loading && loadError == nil }
+    var canPaste: Bool { canQueueTransfer && session.canPaste }
 
     func paste() {
-        guard canModifyDirectory, let request = session.beginPaste() else { return }
-        let directory = self.directory
-        perform("无法粘贴", at: directory, operation: {
-            FileOperationResult.apply(to: FileSystem.selectedRoots(request.urls)) { source in
-                try FileSystem.paste(source, into: directory, move: request.movesFiles)
-            }
-        }, onCompletion: { result in
-            self.session.finishPaste(request, retrying: result.failures.map(\.source))
-        })
+        guard canQueueTransfer, let request = session.beginPaste() else { return }
+        if session.enqueuePaste?(request, directory) != true {
+            session.finishPaste(request, retrying: request.urls)
+        }
     }
 
     func batchRename(_ entries: [FileEntry], rule: BatchRenameRule) {
         guard canModifyDirectory else { return }
-        perform("无法批量重命名", at: directory) {
+        perform("无法批量重命名", at: directory, history: .batchRename) {
             try BatchRenamePlan(items: entries, rule: rule).apply()
         }
     }
@@ -602,36 +599,48 @@ final class BrowserModel {
                 if self?.directory == prompt.directory { self?.query = "" }
             }
         case .rename(let entry):
-            perform("无法重命名", at: prompt.directory) {
-                FileOperationResult(revealed: [try FileSystem.rename(entry, name: value)])
-            } onCompletion: { result in
-                if self.session.stash.contains(where: { $0.standardizedFileURL.path == entry.url.standardizedFileURL.path }) {
-                    self.session.updateStash(adding: result.revealed, removing: [entry.url])
-                }
+            perform("无法重命名", at: prompt.directory, history: .rename) {
+                let target = try FileSystem.rename(entry, name: value)
+                let changes = target.path.utf8.elementsEqual(entry.url.path.utf8) ? []
+                    : [FileRelocation(original: entry.url, current: target)]
+                return FileOperationResult(revealed: [target], relocations: changes)
             }
         case .trash(let items):
-            perform("无法移到废纸篓", at: prompt.directory) {
-                FileOperationResult.apply(to: FileSystem.selectedRoots(items.map(\.url))) { url in
-                    try FileManager.default.trashItem(at: url, resultingItemURL: nil)
-                    return nil
+            perform("无法移到废纸篓", at: prompt.directory, history: .trash) {
+                var result = FileOperationResult()
+                for url in FileSystem.selectedRoots(items.map(\.url)) {
+                    do {
+                        if let target = try FileSystem.trash(url) {
+                            result.relocations.append(FileRelocation(original: url, current: target))
+                        }
+                    } catch {
+                        result.failures.append(.init(source: url, message: error.localizedDescription))
+                    }
                 }
+                return result
             }
         }
     }
 
     private func perform(
-        _ title: String, at location: URL,
+        _ title: String, at location: URL, history: FileHistoryEntry.Kind? = nil,
         operation: @escaping @Sendable () throws -> FileOperationResult,
         onCompletion: @escaping (FileOperationResult) -> Void = { _ in }
     ) {
         guard !busy, !session.isTransferring else { return }
         busy = true
+        session.localMutationCount += 1
         watchRefresh?.cancel()
         Task {
             let result = await Task.detached(priority: .userInitiated, operation: operation).result
             busy = false
+            defer { session.finishMutation() }
             switch result {
             case .success(let outcome):
+                if let history {
+                    let changes = session.updateStash(for: outcome.relocations, keepingReferences: history != .trash)
+                    session.history.record(history, count: changes.count, detail: location.path, relocations: changes)
+                }
                 onCompletion(outcome)
                 if !outcome.failures.isEmpty { issue = BrowserIssue(title: title, message: outcome.failureSummary) }
                 if directory == location { refresh(revealing: outcome.revealed) }

@@ -21,8 +21,10 @@ struct PerchFilesApp: App {
 
     var body: some Scene {
         Window("wfolder", id: "browser") {
-            BrowserView(directory: Self.startingDirectory, restoresSession: Self.startingDirectory == nil)
-                .frame(minWidth: 920, minHeight: 510)
+            BrowserView(directory: Self.startingDirectory, restoresSession: Self.startingDirectory == nil) {
+                delegate.workspace = $0
+            }
+            .frame(minWidth: 920, minHeight: 510)
         }
         .windowToolbarStyle(.unified)
         .defaultSize(width: 1_170, height: 720)
@@ -40,6 +42,18 @@ struct PerchFilesApp: App {
 }
 
 final class PerchDelegate: NSObject, NSApplicationDelegate {
+    weak var workspace: BrowserWorkspace?
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let workspace, workspace.hasFileMutations else { return .terminateNow }
+        workspace.cancelTransfersForQuit()
+        Task {
+            while workspace.hasFileMutations { try? await Task.sleep(for: .milliseconds(100)) }
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
@@ -106,6 +120,15 @@ private struct BrowserCommands: Commands {
             }
             .keyboardShortcut("f")
             .disabled(browser == nil)
+        }
+        CommandMenu("文件操作") {
+            Button("传输队列…") { workspace?.revealOperations(.transfers) }
+                .disabled(workspace == nil)
+            Button("操作历史…") { workspace?.revealOperations(.history) }
+                .disabled(workspace == nil)
+            Button("撤销文件操作") { workspace?.revealOperations(.history); workspace?.undoFileOperation() }
+                .keyboardShortcut("z", modifiers: [.command, .option])
+                .disabled(workspace?.canUndoFileOperation != true)
         }
         CommandMenu("工作区") {
             Button("保存或打开工作区…") { workspace?.presentedTool = .workspaces }

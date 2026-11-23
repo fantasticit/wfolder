@@ -5,9 +5,11 @@ struct BrowserView: View {
 
     @ViewState private var workspace: BrowserWorkspace
     private let restoresSession: Bool
+    private let onWorkspaceReady: (BrowserWorkspace) -> Void
 
-    init(directory: URL?, restoresSession: Bool) {
+    init(directory: URL?, restoresSession: Bool, onWorkspaceReady: @escaping (BrowserWorkspace) -> Void) {
         self.restoresSession = restoresSession
+        self.onWorkspaceReady = onWorkspaceReady
         _workspace = State(initialValue: BrowserWorkspace(directory: directory ?? BrowserModel.home,
                                                           restoreSession: restoresSession))
     }
@@ -31,6 +33,7 @@ struct BrowserView: View {
                 }
         }
         .focusedSceneValue(\.browserWorkspace, workspace)
+        .onAppear { onWorkspaceReady(workspace) }
         .task(id: workspace.snapshot) {
             guard restoresSession else { return }
             do { try await Task.sleep(for: .milliseconds(220)) } catch { return }
@@ -73,19 +76,13 @@ struct BrowserView: View {
             case .spotlight: SpotlightSearchView(workspace: workspace)
             }
         }
-        .alert(item: Binding(get: { workspace.pendingTransfer == nil ? workspace.transferIssue ?? model.issue : nil },
-                             set: { _ in
-            if workspace.transferIssue != nil { workspace.transferIssue = nil }
-            else { model.issue = nil }
-        })) { issue in
+        .alert(item: $model.issue) { issue in
             Alert(title: Text(issue.title), message: Text(issue.message), dismissButton: .default(Text("好")))
         }
-        .alert("发现同名项目", isPresented: Binding(get: { workspace.pendingTransfer != nil }, set: { _ in }),
-               presenting: workspace.pendingTransfer) { _ in
-            Button("保留两份") { workspace.resolveTransfer(keepingBoth: true) }
-            Button("跳过同名项", role: .cancel) { workspace.resolveTransfer(keepingBoth: false) }
-        } message: { conflict in
-            Text(conflict.message)
+        .onChange(of: workspace.transfers.conflictJob?.reviewID) { _, review in
+            if review != nil, workspace.presentedTool == nil, model.prompt == nil, model.expandedPreview == nil {
+                workspace.revealOperations(.transfers)
+            }
         }
     }
 
@@ -179,7 +176,7 @@ struct BrowserView: View {
 
         ToolbarItemGroup(placement: .primaryAction) {
             Button("剪切", systemImage: "scissors") { model.copy(model.selectedEntries, cut: true) }
-                .disabled(model.selectedIDs.isEmpty || !model.canModifyDirectory)
+                .disabled(model.selectedIDs.isEmpty || !model.canQueueTransfer)
                 .help("剪切（⌘X）")
             Button("复制", systemImage: "doc.on.doc") { model.copy(model.selectedEntries) }
                 .disabled(model.selectedIDs.isEmpty)
@@ -201,6 +198,18 @@ struct BrowserView: View {
 
         ToolbarItemGroup(placement: .automatic) {
             FileViewMenu(model: model, workspace: workspace)
+            Button {
+                if workspace.showsOperations { workspace.showsOperations = false }
+                else { workspace.revealOperations(.transfers) }
+            } label: {
+                Label("文件操作", systemImage: workspace.transfers.conflictJob == nil
+                      ? "arrow.left.arrow.right.circle" : "exclamationmark.circle.fill")
+            }
+            .help(workspace.transfers.unfinished == 0 ? "传输队列和操作历史"
+                  : "\(workspace.transfers.unfinished) 个待处理传输任务")
+            .popover(isPresented: Binding(get: { workspace.showsOperations }, set: { workspace.showsOperations = $0 })) {
+                FileOperationsView(workspace: workspace)
+            }
             Menu {
                 Button("保存或打开工作区…", systemImage: "rectangle.split.2x1") { workspace.presentedTool = .workspaces }
                 Button("文件暂存架", systemImage: "tray", action: workspace.openStashPane)
@@ -568,6 +577,15 @@ private struct BrowserPane: View {
                         .lineLimit(1)
                         .help(dropHint.directory?.path ?? dropHint.title)
                         .foregroundStyle(Color.accentColor)
+                } else if let job = workspace.transfers.active {
+                    Button {
+                        workspace.revealOperations(.transfers)
+                    } label: {
+                        Label(job.state == .conflicts ? "有同名项目待处理"
+                               : "\(job.request.operation.title) \(job.processed)/\(job.total)",
+                              systemImage: job.state == .conflicts ? "exclamationmark.circle" : "arrow.left.arrow.right")
+                    }
+                    .buttonStyle(.plain)
                 } else if workspace.isTransferring || model.busy {
                     ProgressView().controlSize(.mini)
                     Text("正在处理…")

@@ -75,42 +75,52 @@ struct BatchRenamePlan: Sendable {
 
     func apply() throws -> FileOperationResult {
         guard canApply else { throw BatchRenameError.conflicts }
+        let pairs = rows.filter(\.changed).map { row in
+            (row.source, row.source.deletingLastPathComponent().appendingPathComponent(row.proposed))
+        }
+        try FileSystem.relocateGroup(pairs)
+        return FileOperationResult(revealed: pairs.map { $0.1 }, relocations: pairs.map {
+            FileRelocation(original: $0.0, current: $0.1)
+        })
+    }
+}
+
+extension FileSystem {
+    static func relocateGroup(_ pairs: [(URL, URL)]) throws {
         struct Change {
             let original: URL
             let temporary: URL
             let target: URL
         }
-        let changes = rows.filter(\.changed).map { row in
-            let parent = row.source.deletingLastPathComponent()
-            return Change(original: row.source, temporary: parent.appendingPathComponent(".wfolder-" + UUID().uuidString),
-                          target: parent.appendingPathComponent(row.proposed))
+        let changes = pairs.map { source, target in
+            let temporary = source.deletingLastPathComponent().appendingPathComponent(".wfolder-" + UUID().uuidString)
+            return Change(original: source, temporary: temporary, target: target)
         }
         var staged: [Change] = []
         var finished: [Change] = []
         do {
             for change in changes {
-                try FileSystem.moveExclusive(from: change.original, to: change.temporary)
+                try moveExclusive(from: change.original, to: change.temporary)
                 staged.append(change)
             }
             for change in staged {
-                try FileSystem.moveExclusive(from: change.temporary, to: change.target)
+                try moveExclusive(from: change.temporary, to: change.target)
                 finished.append(change)
             }
         } catch {
             var lost: [String] = []
             for change in finished.reversed() {
-                do { try FileSystem.moveExclusive(from: change.target, to: change.temporary) }
+                do { try moveExclusive(from: change.target, to: change.temporary) }
                 catch { lost.append(change.target.path) }
             }
             let stillAtTarget = Set(lost)
             for change in staged.reversed() where !stillAtTarget.contains(change.target.path) {
-                do { try FileSystem.moveExclusive(from: change.temporary, to: change.original) }
+                do { try moveExclusive(from: change.temporary, to: change.original) }
                 catch { lost.append(change.temporary.path) }
             }
             if !lost.isEmpty { throw BatchRenameError.rollback(lost) }
             throw error
         }
-        return FileOperationResult(revealed: changes.map(\.target))
     }
 }
 

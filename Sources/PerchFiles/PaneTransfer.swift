@@ -18,48 +18,6 @@ struct PaneTransfer: Sendable {
     let directory: URL
     let operation: PaneTransferOperation
     var fromStash = false
-
-    struct Result: Sendable {
-        var files = FileOperationResult()
-        var conflicts: [URL] = []
-        var movedSources: [URL] = []
-    }
-
-    func run(keepingBoth: Bool) -> Result {
-        var result = Result()
-        for source in sources {
-            do {
-                let target: URL
-                do {
-                    target = try FileSystem.paste(source, into: directory, move: operation == .move)
-                } catch where FileSystem.isNameConflict(error) {
-                    guard keepingBoth else {
-                        result.conflicts.append(source)
-                        continue
-                    }
-                    target = try FileSystem.copyWithAvailableName(FileEntry.read(source), into: directory,
-                                                                  move: operation == .move)
-                }
-                result.files.revealed.append(target)
-                if operation == .move, source.path != target.path { result.movedSources.append(source) }
-            } catch {
-                result.files.failures.append(.init(source: source, message: error.localizedDescription))
-            }
-        }
-        return result
-    }
-}
-
-struct PaneTransferConflict: Identifiable {
-    let id = UUID()
-    let request: PaneTransfer
-    let completedCount: Int
-
-    var message: String {
-        let names = request.sources.prefix(3).map(\.lastPathComponent).joined(separator: "、")
-        let count = request.sources.count
-        return "已\(request.operation.title) \(completedCount) 项。目标文件夹中有 \(count) 个同名项目。\n\(names)"
-    }
 }
 
 enum FileDropHint: Equatable {

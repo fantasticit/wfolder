@@ -17,7 +17,7 @@ struct BrowserFileActions {
         if model.isStash {
             scroll.storeInStash = { workspace.storeInStash($0) }
         } else {
-            scroll.canReceive = { model.canModifyDirectory }
+            scroll.canReceive = { model.canQueueTransfer }
             scroll.destination = { folderAt($0) ?? model.directory }
             scroll.receive = { urls, directory, operation, fromStash in
                 workspace.transfer(urls, into: directory, operation: operation, fromStash: fromStash)
@@ -40,10 +40,10 @@ struct BrowserFileActions {
             model.copy(selected)
         case "x":
             let selected = items()
-            guard !selected.isEmpty, model.canModifyDirectory else { return false }
+            guard !selected.isEmpty, model.canQueueTransfer else { return false }
             model.copy(selected, cut: true)
         case "v":
-            guard model.canModifyDirectory else { return false }
+            guard model.canPaste else { return false }
             model.paste()
         default: return false
         }
@@ -100,7 +100,7 @@ struct BrowserFileActions {
             })
         }
         menu.addItem(action("加入暂存架", "tray.and.arrow.down") { workspace.storeInStash(items.map(\.url)) })
-        menu.addItem(action("剪切", "scissors", enabled: canModify) { self.model.copy(items, cut: true) })
+        menu.addItem(action("剪切", "scissors", enabled: model.canQueueTransfer) { self.model.copy(items, cut: true) })
         menu.addItem(action("复制", "doc.on.doc") { self.model.copy(items) })
         menu.addItem(action("粘贴到当前文件夹", "clipboard", enabled: model.canPaste) { self.model.paste() })
         let targets = workspace.transferTargets(from: model)

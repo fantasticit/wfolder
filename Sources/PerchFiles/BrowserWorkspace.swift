@@ -14,6 +14,10 @@ final class BrowserSession {
     var showHidden = UserDefaults.standard.bool(forKey: "showHidden")
     var showPreview = true
     var isTransferring = false
+    var localMutationCount = 0
+    let history: FileHistory
+    @ObservationIgnored var enqueuePaste: ((PasteRequest, URL) -> Bool)?
+    @ObservationIgnored var mutationFinished: (() -> Void)?
     var viewSettings = FileViewSettings.restore() {
         didSet { if viewSettings != oldValue { viewSettings.store() } }
     }
@@ -30,17 +34,38 @@ final class BrowserSession {
     init(clipboard: NSPasteboard? = nil, defaults: UserDefaults = .standard) {
         self.clipboard = clipboard ?? .general
         storage = WorkspaceStorage(defaults: defaults)
+        history = FileHistory(defaults: defaults)
         stash = storage.stash
     }
 
     func updateStash(adding urls: [URL] = [], removing removed: [URL] = []) {
-        let paths = Set(removed.map { $0.standardizedFileURL.path })
-        var next = stash.filter { !paths.contains($0.standardizedFileURL.path) }
-        var known = Set(next.map { $0.standardizedFileURL.path })
-        next += urls.filter(\.isFileURL).map(\.standardizedFileURL).filter { known.insert($0.path).inserted }
+        let paths = Set(removed.map(FileSystem.locationKey))
+        var next = stash.filter { !paths.contains(FileSystem.locationKey($0)) }
+        var known = Set(next.map(FileSystem.locationKey))
+        next += urls.filter(\.isFileURL).map(\.standardizedFileURL).filter { known.insert(FileSystem.locationKey($0)).inserted }
         guard next != stash else { return }
         stash = next
         storage.saveStash(next)
+    }
+
+    func finishMutation() {
+        localMutationCount -= 1
+        mutationFinished?()
+    }
+
+    func updateStash(for changes: [FileRelocation], keepingReferences: Bool) -> [FileRelocation] {
+        guard !changes.isEmpty, !stash.isEmpty else { return changes }
+        let paths = Set(stash.map(FileSystem.locationKey))
+        let recorded = changes.map { change -> FileRelocation in
+            var change = change
+            change.wasInStash = paths.contains(FileSystem.locationKey(change.original))
+            return change
+        }
+        let stashed = recorded.filter(\.wasInStash)
+        if !stashed.isEmpty {
+            updateStash(adding: keepingReferences ? stashed.map(\.current) : [], removing: stashed.map(\.original))
+        }
+        return recorded
     }
 
     var canPaste: Bool { hasFileURLs && !isPasting }
@@ -138,7 +163,7 @@ final class BrowserWorkspace {
         var title: String { "面板 \(number) · \(browser.directoryName)" }
 
         func accepts(_ urls: [URL], operation: PaneTransferOperation) -> Bool {
-            guard browser.canModifyDirectory, !urls.isEmpty else { return false }
+            guard browser.canQueueTransfer, !urls.isEmpty else { return false }
             return operation == .copy || urls.contains { $0.deletingLastPathComponent().path != browser.directory.path }
         }
     }
@@ -160,9 +185,11 @@ final class BrowserWorkspace {
     private(set) var activeIndex = 0
     private(set) var addressFocusRequest = 0
     private(set) var paneFocusRequest = 0
-    private(set) var pendingTransfer: PaneTransferConflict?
-    var transferIssue: BrowserIssue?
+    let transfers = TransferQueue()
     var transferChoice: TransferChoice?
+    var showsOperations = false
+    var operationsTab: FileOperationsTab = .transfers
+    var history: FileHistory { session.history }
 
     init(directory: URL, clipboard: NSPasteboard? = nil, restoreSession: Bool = false,
          defaults: UserDefaults = .standard) {
@@ -178,6 +205,15 @@ final class BrowserWorkspace {
         } else {
             tabs = [Tab(browser: BrowserModel(directory: directory, session: session))]
         }
+        session.enqueuePaste = { [weak self] request, directory in
+            guard let self else { return false }
+            return self.transfer(request.urls, into: directory, operation: request.movesFiles ? .move : .copy) { [weak self] job in
+                let completed = Set(job.completed.map(FileSystem.locationKey))
+                let failed = FileSystem.selectedRoots(request.urls).filter { !completed.contains(FileSystem.locationKey($0)) }
+                self?.session.finishPaste(request, retrying: failed)
+            }
+        }
+        session.mutationFinished = { [weak self] in self?.advanceTransfers() }
     }
 
     var snapshot: SessionSnapshot {
@@ -312,53 +348,84 @@ final class BrowserWorkspace {
     }
 
     @discardableResult
-    func transfer(_ urls: [URL], into directory: URL, operation: PaneTransferOperation, fromStash: Bool = false) -> Bool {
-        guard !isTransferring, !tabs.flatMap(\.browsers).contains(where: \.busy) else { return false }
-        var paths = Set<String>()
-        let sources = FileSystem.selectedRoots(urls.filter { paths.insert($0.standardizedFileURL.path).inserted })
-        guard !sources.isEmpty else { return false }
-        session.isTransferring = true
-        runTransfer(PaneTransfer(sources: sources, directory: directory, operation: operation, fromStash: fromStash), keepingBoth: false)
+    func transfer(_ urls: [URL], into directory: URL, operation: PaneTransferOperation, fromStash: Bool = false,
+                  onFinish: ((TransferJob) -> Void)? = nil) -> Bool {
+        let sources = FileSystem.selectedRoots(urls.filter(\.isFileURL).map(\.standardizedFileURL))
+        guard !sources.isEmpty, directory.isFileURL else { return false }
+        transfers.append(PaneTransfer(sources: sources, directory: directory.standardizedFileURL,
+                                      operation: operation, fromStash: fromStash), onFinish: onFinish)
+        advanceTransfers()
         return true
+    }
+
+    func retryTransfer(_ job: TransferJob) {
+        transfer(job.failures.map(\.source), into: job.request.directory,
+                 operation: job.request.operation, fromStash: job.request.fromStash)
+    }
+
+    private func advanceTransfers() {
+        guard transfers.hasWaiting, !session.isTransferring, session.localMutationCount == 0 else { return }
+        session.isTransferring = true
+        transfers.startNext { [weak self] job in
+            guard let self else { return }
+            let relocations = self.session.updateStash(for: job.moved, keepingReferences: false)
+            let moving = job.request.operation == .move
+            self.history.record(moving ? .move : .copy, count: moving ? relocations.count : job.completed.count,
+                                detail: job.request.directory.path, relocations: relocations + job.backups)
+            self.refreshLocations(job.request.sources, directories: [job.request.directory])
+            self.session.isTransferring = false
+            self.advanceTransfers()
+        }
+    }
+
+    var hasFileMutations: Bool { session.isTransferring || session.localMutationCount > 0 }
+
+    func cancelTransfersForQuit() {
+        for job in transfers.jobs.reversed() { transfers.cancel(job) }
+    }
+
+    var canUndoFileOperation: Bool {
+        !session.isTransferring && session.localMutationCount == 0 && history.latestUndo != nil
+    }
+
+    func revealOperations(_ tab: FileOperationsTab) {
+        operationsTab = tab
+        showsOperations = true
+    }
+
+    func undoFileOperation() {
+        guard canUndoFileOperation, let entry = history.latestUndo else { return }
+        session.isTransferring = true
+        Task {
+            let result = await Task.detached(priority: .userInitiated) { entry.undo() }.value
+            history.didUndo(entry, result: result)
+            let stashed = result.restored.filter(\.wasInStash)
+            session.updateStash(adding: stashed.map(\.original), removing: stashed.map(\.current))
+            refreshLocations(result.restored.flatMap { [$0.original, $0.current] })
+            session.isTransferring = false
+            advanceTransfers()
+        }
     }
 
     func applyComparison(_ comparison: FolderComparison, selected: Set<String>, direction: FolderCopyDirection,
                          sync: Bool) async -> FileOperationResult? {
-        guard !isTransferring, !tabs.flatMap(\.browsers).contains(where: \.busy) else { return nil }
+        guard !session.isTransferring, session.localMutationCount == 0 else { return nil }
         session.isTransferring = true
         let result = await Task.detached(priority: .userInitiated) {
             comparison.copy(selected, direction: direction, updating: sync)
         }.value
         session.isTransferring = false
         for browser in activeTab.browsers { browser.refreshIfStarted() }
+        advanceTransfers()
         return result
     }
 
-    func resolveTransfer(keepingBoth: Bool) {
-        guard let conflict = pendingTransfer else { return }
-        pendingTransfer = nil
-        if keepingBoth { runTransfer(conflict.request, keepingBoth: true) }
-        else { session.isTransferring = false }
-    }
-
-    private func runTransfer(_ request: PaneTransfer, keepingBoth: Bool) {
-        Task {
-            let result = await Task.detached(priority: .userInitiated) { request.run(keepingBoth: keepingBoth) }.value
-            if request.fromStash, !result.movedSources.isEmpty { removeFromStash(result.movedSources) }
-            let changed = Set(request.sources.map { $0.deletingLastPathComponent().path } + [request.directory.path])
-            for browser in tabs.flatMap(\.browsers) {
-                if changed.contains(browser.directory.path) || (browser.hasSearch && browser.searchScope == .descendants) {
-                    browser.refreshIfStarted()
-                }
-            }
-            if !result.files.failures.isEmpty {
-                transferIssue = BrowserIssue(title: "无法\(request.operation.title)部分项目", message: result.files.failureSummary)
-            }
-            if result.conflicts.isEmpty {
-                session.isTransferring = false
-            } else {
-                pendingTransfer = PaneTransferConflict(request: PaneTransfer(sources: result.conflicts,
-                    directory: request.directory, operation: request.operation, fromStash: request.fromStash), completedCount: result.files.revealed.count)
+    private func refreshLocations(_ items: [URL], directories: [URL] = []) {
+        let changed = Set((items.map { $0.deletingLastPathComponent() } + directories).map { FileSystem.physicalDirectory($0).path })
+        for browser in tabs.flatMap(\.browsers) {
+            if browser.isStash || changed.contains(FileSystem.physicalDirectory(browser.directory).path)
+                || (browser.hasSearch && browser.searchScope == .descendants) {
+                browser.refreshIfStarted()
             }
         }
     }

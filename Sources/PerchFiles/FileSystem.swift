@@ -133,15 +133,25 @@ enum FileSystem {
         return FolderSearchResults(entries: matches, unreadable: unreadable)
     }
 
+    static func locationKey(_ url: URL) -> String {
+        let url = url.standardizedFileURL
+        guard url.path != "/" else { return "/" }
+        let parent = physicalDirectory(url.deletingLastPathComponent())
+        return parent.appendingPathComponent(url.lastPathComponent).path
+    }
+
     static func selectedRoots(_ urls: [URL]) -> [URL] {
-        let selected = Set(urls.map { $0.standardizedFileURL.path })
-        return urls.filter { url in
-            var parent = url.standardizedFileURL.deletingLastPathComponent()
-            while parent.path != "/" && !parent.path.isEmpty {
-                if selected.contains(parent.path) { return false }
-                parent.deleteLastPathComponent()
+        let keys = urls.map(locationKey)
+        let selected = Set(keys)
+        var seen = Set<String>()
+        return zip(urls, keys).compactMap { url, key in
+            guard seen.insert(key).inserted else { return nil }
+            var parent = (key as NSString).deletingLastPathComponent
+            while parent != "/" && !parent.isEmpty {
+                if selected.contains(parent) { return nil }
+                parent = (parent as NSString).deletingLastPathComponent
             }
-            return !selected.contains("/") || url.path == "/"
+            return !selected.contains("/") || key == "/" ? url : nil
         }
     }
 
@@ -182,6 +192,12 @@ enum FileSystem {
         let target = entry.url.deletingLastPathComponent().appendingPathComponent(name, isDirectory: entry.isFolder)
         try moveExclusive(from: entry.url, to: target)
         return target
+    }
+
+    static func trash(_ url: URL) throws -> URL? {
+        var result: NSURL?
+        try FileManager.default.trashItem(at: url, resultingItemURL: &result)
+        return result as URL?
     }
 
     static func moveExclusive(from original: URL, to target: URL) throws {
