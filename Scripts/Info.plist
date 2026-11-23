@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>zh_CN</string>
+	<key>CFBundleDisplayName</key>
+	<string>wfolder</string>
+	<key>CFBundleExecutable</key>
+	<string>PerchFiles</string>
+	<key>CFBundleIconFile</key>
+	<string>PerchIcon.icns</string>
+	<key>CFBundleIdentifier</key>
+	<string>local.perchfiles.browser</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>wfolder</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>2.7.1</string>
+	<key>CFBundleVersion</key>
+	<string>18</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>wfolder需要读取桌面内容，以浏览和操作该文件夹中的文件。</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>wfolder需要读取文稿内容，以浏览和操作该文件夹中的文件。</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>wfolder需要读取下载内容，以浏览和操作该文件夹中的文件。</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+</dict>
+</plist>
