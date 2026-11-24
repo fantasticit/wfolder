@@ -1,6 +1,8 @@
 import AppKit
+import AVFoundation
 import QuickLookThumbnailing
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct FileGrid: NSViewRepresentable {
     let actions: BrowserFileActions
@@ -77,8 +79,8 @@ struct FileGrid: NSViewRepresentable {
             coordinator.showExtensions = showExtensions
             if dataChanged { grid.selectionAnchor = nil }
             layout.itemSize = mode == .large
-                ? NSSize(width: 156, height: showsLocation ? 157 : 141)
-                : NSSize(width: 112, height: showsLocation ? 117 : 101)
+                ? NSSize(width: 156, height: showsLocation ? 166 : 150)
+                : NSSize(width: 112, height: showsLocation ? 130 : 114)
             grid.reloadData()
         }
         if directoryChanged {
@@ -125,9 +127,20 @@ struct FileGrid: NSViewRepresentable {
 
         private weak var grid: NSCollectionView?
         private var thumbnailRefreshScheduled = false
+        private enum ThumbnailRequest {
+            case image(QLThumbnailGenerator.Request)
+            case video(Task<Void, Never>)
+
+            func cancel() {
+                switch self {
+                case .image(let request): QLThumbnailGenerator.shared.cancel(request)
+                case .video(let task): task.cancel()
+                }
+            }
+        }
         private struct PendingThumbnail {
             let token: UUID
-            let request: QLThumbnailGenerator.Request
+            let request: ThumbnailRequest
         }
         private var requests: [String: PendingThumbnail] = [:]
         private var failedKeys = Set<String>()
@@ -153,7 +166,7 @@ struct FileGrid: NSViewRepresentable {
         func stopObserving() {
             NotificationCenter.default.removeObserver(self)
             grid = nil
-            for pending in requests.values { QLThumbnailGenerator.shared.cancel(pending.request) }
+            for pending in requests.values { pending.request.cancel() }
             requests.removeAll()
         }
 
@@ -208,52 +221,98 @@ struct FileGrid: NSViewRepresentable {
             guard let grid, let window = grid.window else { return }
             let viewport = grid.visibleRect
             let scale = window.backingScaleFactor
-            let edge = mode == .large ? 124 : 84
+            let edge: CGFloat = mode == .large ? 132 : 94
             let visible = grid.visibleItems().compactMap { item -> (String, FileGridItem, FileEntry)? in
                 guard let item = item as? FileGridItem, item.view.frame.intersects(viewport),
-                      let entry = item.entry, !entry.isFolder else { return nil }
+                      let entry = item.entry, !entry.isFolder, !entry.isApplication,
+                      entry.sourceLanguage == nil,
+                      entry.mediaKind == .video || entry.contentType?.conforms(to: .image) == true else { return nil }
                 let key = "\(entry.url.path)\u{0}\(entry.modified?.timeIntervalSinceReferenceDate ?? -1)\u{0}\(entry.size ?? -1)\u{0}\(edge)\u{0}\(scale)"
                 return (key, item, entry)
             }
             let visibleKeys = Set(visible.map(\.0))
             for (key, pending) in requests where !visibleKeys.contains(key) {
-                QLThumbnailGenerator.shared.cancel(pending.request)
+                pending.request.cancel()
                 requests.removeValue(forKey: key)
             }
             failedKeys.formIntersection(visibleKeys)
             for (key, item, entry) in visible {
                 if let thumb = Self.thumbnails.object(forKey: key as NSString) {
-                    item.showThumbnail(thumb.image, key: key)
+                    item.showThumbnail(thumb, key: key)
                 } else if requests.count < 4, requests[key] == nil, !failedKeys.contains(key), item.thumbnailKey != key {
-                    let request = QLThumbnailGenerator.Request(fileAt: entry.url,
-                        size: CGSize(width: edge, height: edge), scale: scale, representationTypes: .thumbnail)
-                    let token = UUID()
-                    requests[key] = PendingThumbnail(token: token, request: request)
-                    QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { [weak self] representation, _ in
-                        let image = representation?.cgImage
-                        DispatchQueue.main.async {
-                            guard let self, self.requests[key]?.token == token else { return }
-                            self.requests.removeValue(forKey: key)
-                            if let image {
-                                let cost = image.bytesPerRow * image.height
-                                let size = CGSize(width: CGFloat(image.width) / scale, height: CGFloat(image.height) / scale)
-                                let thumbnail = NSImage(cgImage: image, size: size)
-                                Self.thumbnails.setObject(GridThumbnail(image: thumbnail), forKey: key as NSString, cost: cost)
-                            } else {
-                                self.failedKeys.insert(key)
-                            }
-                            self.scheduleThumbnails()
-                        }
+                    requestThumbnail(for: entry, key: key, edge: edge, scale: scale)
+                }
+            }
+        }
+
+        private func requestThumbnail(for entry: FileEntry, key: String, edge: CGFloat, scale: CGFloat) {
+            let token = UUID()
+            if entry.mediaKind == .video {
+                let task = Task { [weak self] in
+                    let video = await GridThumbnail.videoFrame(at: entry.url, pixelEdge: edge * scale)
+                    guard !Task.isCancelled else { return }
+                    self?.finishThumbnail(for: key, token: token, pixels: video?.pixels, scale: scale, duration: video?.duration)
+                }
+                requests[key] = PendingThumbnail(token: token, request: .video(task))
+            } else {
+                let request = QLThumbnailGenerator.Request(fileAt: entry.url,
+                    size: CGSize(width: edge, height: edge), scale: scale, representationTypes: .thumbnail)
+                requests[key] = PendingThumbnail(token: token, request: .image(request))
+                QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { [weak self] representation, _ in
+                    let pixels = representation?.cgImage
+                    DispatchQueue.main.async {
+                        self?.finishThumbnail(for: key, token: token, pixels: pixels, scale: scale)
                     }
                 }
             }
+        }
+
+        private func finishThumbnail(for key: String, token: UUID, pixels: CGImage?, scale: CGFloat, duration: TimeInterval? = nil) {
+            guard requests[key]?.token == token else { return }
+            requests.removeValue(forKey: key)
+            if let pixels {
+                let thumbnail = GridThumbnail(pixels: pixels, scale: scale, duration: duration)
+                Self.thumbnails.setObject(thumbnail, forKey: key as NSString, cost: pixels.bytesPerRow * pixels.height)
+            } else {
+                failedKeys.insert(key)
+            }
+            scheduleThumbnails()
         }
     }
 }
 
 private final class GridThumbnail {
     let image: NSImage
-    init(image: NSImage) { self.image = image }
+    let duration: String?
+
+    init(pixels: CGImage, scale: CGFloat, duration: TimeInterval?) {
+        image = NSImage(cgImage: pixels, size: CGSize(width: CGFloat(pixels.width) / scale,
+                                                     height: CGFloat(pixels.height) / scale))
+        if let duration, duration.isFinite, duration >= 0, let seconds = Int(exactly: duration.rounded()) {
+            if seconds >= 3600 {
+                self.duration = "\(seconds / 3600):" + String(format: "%02d:%02d", seconds / 60 % 60, seconds % 60)
+            } else {
+                self.duration = "\(seconds / 60):" + String(format: "%02d", seconds % 60)
+            }
+        } else {
+            self.duration = nil
+        }
+    }
+
+    static func videoFrame(at url: URL, pixelEdge: CGFloat) async -> (pixels: CGImage, duration: TimeInterval?)? {
+        let asset = AVURLAsset(url: url)
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.maximumSize = CGSize(width: pixelEdge, height: pixelEdge)
+        generator.appliesPreferredTrackTransform = true
+        return await withTaskCancellationHandler {
+            guard !Task.isCancelled, let frame = try? await generator.image(at: .zero),
+                  !Task.isCancelled else { return nil }
+            let duration = try? await asset.load(.duration)
+            return (frame.image, duration?.seconds)
+        } onCancel: {
+            generator.cancelAllCGImageGeneration()
+        }
+    }
 }
 
 private final class BrowserCollectionView: NSCollectionView, FileDragSource {
@@ -329,17 +388,48 @@ private final class FileGridTile: NSView {
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         if selected {
-            NSColor.selectedContentBackgroundColor.setFill()
-            NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 8, yRadius: 8).fill()
+            let frame = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 9, yRadius: 9)
+            NSColor.controlAccentColor.withAlphaComponent(0.20).setFill()
+            frame.fill()
+            NSColor.controlAccentColor.withAlphaComponent(0.65).setStroke()
+            frame.lineWidth = 1
+            frame.stroke()
         }
+    }
+}
+
+private final class FileGridPicture: NSImageView {
+    var duration: String? { didSet { needsDisplay = true } }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard let duration, let image, image.size.width > 0, image.size.height > 0 else { return }
+        let scale = min(1, bounds.width / image.size.width, bounds.height / image.size.height)
+        let width = image.size.width * scale
+        let height = image.size.height * scale
+        let text = NSAttributedString(string: duration, attributes: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .semibold),
+            .foregroundColor: NSColor.white
+        ])
+        let size = text.size()
+        let badgeWidth = size.width + 8
+        let badgeHeight = size.height + 2
+        guard width >= badgeWidth + 6, height >= badgeHeight + 6 else { return }
+        let badge = NSRect(x: bounds.midX + width / 2 - badgeWidth - 3,
+                           y: isFlipped ? bounds.midY + height / 2 - badgeHeight - 3 : bounds.midY - height / 2 + 3,
+                           width: badgeWidth, height: badgeHeight)
+        NSColor.black.withAlphaComponent(0.76).setFill()
+        NSBezierPath(roundedRect: badge, xRadius: 3, yRadius: 3).fill()
+        text.draw(at: NSPoint(x: badge.minX + 4, y: badge.minY + 1))
     }
 }
 
 private final class FileGridItem: NSCollectionViewItem {
     static let identifier = NSUserInterfaceItemIdentifier("FileGridItem")
     private let nameLabel = NSTextField(labelWithString: "")
+    private let kindLabel = NSTextField(labelWithString: "")
     private let location = NSTextField(labelWithString: "")
-    private let picture = NSImageView()
+    private let picture = FileGridPicture()
     private var pictureHeight: NSLayoutConstraint!
     private(set) var entry: FileEntry?
     private(set) var thumbnailKey: String?
@@ -352,14 +442,17 @@ private final class FileGridItem: NSCollectionViewItem {
         picture.imageScaling = .scaleProportionallyDown
         pictureHeight = picture.heightAnchor.constraint(equalToConstant: 62)
         nameLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        kindLabel.font = .systemFont(ofSize: 10)
+        kindLabel.textColor = .secondaryLabelColor
         location.font = .systemFont(ofSize: 10)
-        for label in [nameLabel, location] {
+        location.textColor = .secondaryLabelColor
+        for label in [nameLabel, kindLabel, location] {
             label.alignment = .center
             label.maximumNumberOfLines = 1
             label.lineBreakMode = .byTruncatingMiddle
             label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         }
-        let stack = NSStackView(views: [picture, nameLabel, location])
+        let stack = NSStackView(views: [picture, nameLabel, kindLabel, location])
         stack.orientation = .vertical
         stack.alignment = .centerX
         stack.spacing = 3
@@ -372,6 +465,7 @@ private final class FileGridItem: NSCollectionViewItem {
             picture.widthAnchor.constraint(equalTo: stack.widthAnchor),
             pictureHeight,
             nameLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            kindLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
             location.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])
     }
@@ -382,21 +476,29 @@ private final class FileGridItem: NSCollectionViewItem {
 
     private func applySelection() {
         (view as? FileGridTile)?.selected = isSelected
-        nameLabel.textColor = isSelected ? .alternateSelectedControlTextColor : .labelColor
-        location.textColor = isSelected ? .alternateSelectedControlTextColor : .secondaryLabelColor
+        nameLabel.font = .systemFont(ofSize: 12, weight: isSelected ? .semibold : .medium)
     }
 
     func configure(_ entry: FileEntry, mode: FileViewMode, showsLocation: Bool, showExtensions: Bool) {
         self.entry = entry
         thumbnailKey = nil
+        picture.duration = nil
         let large = mode == .large
-        pictureHeight.constant = large ? 102 : 62
-        let glyph = entry.glyph
-        picture.image = NSImage(systemSymbolName: glyph.symbol, accessibilityDescription: nil)?
-            .withSymbolConfiguration(.init(pointSize: large ? 60 : 40, weight: .regular))
-        picture.contentTintColor = glyph.tint
-        picture.setAccessibilityLabel("文件图标")
+        pictureHeight.constant = large ? 98 : 62
+        picture.image = entry.placeholderIcon(size: large ? 62 : 43, detailed: true)
+        picture.contentTintColor = entry.glyph.tint
+        picture.setAccessibilityLabel(entry.iconAccessibilityLabel)
+        picture.imageScaling = .scaleProportionallyDown
+        if entry.hasNativeIcon {
+            FileIcons.shared.load(for: entry) { [weak self] image in
+                guard let self, self.entry == entry, self.thumbnailKey == nil else { return }
+                self.picture.contentTintColor = nil
+                self.picture.imageScaling = .scaleProportionallyUpOrDown
+                self.picture.image = image
+            }
+        }
         nameLabel.stringValue = entry.displayName(showExtensions: showExtensions)
+        kindLabel.stringValue = entry.kind
         let path = entry.url.deletingLastPathComponent().path
         location.isHidden = !showsLocation
         location.stringValue = showsLocation ? (path as NSString).abbreviatingWithTildeInPath : ""
@@ -404,11 +506,13 @@ private final class FileGridItem: NSCollectionViewItem {
         applySelection()
     }
 
-    func showThumbnail(_ image: NSImage, key: String) {
+    func showThumbnail(_ thumbnail: GridThumbnail, key: String) {
         guard thumbnailKey != key else { return }
         thumbnailKey = key
         picture.contentTintColor = nil
-        picture.image = image
-        picture.setAccessibilityLabel("缩略图")
+        picture.imageScaling = .scaleProportionallyDown
+        picture.image = thumbnail.image
+        picture.duration = thumbnail.duration
+        picture.setAccessibilityLabel(thumbnail.duration.map { "视频缩略图 · 时长 \($0)" } ?? "缩略图")
     }
 }

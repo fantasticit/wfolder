@@ -90,6 +90,7 @@ final class BrowserModel {
     var prompt: FilePrompt?
     var expandedPreview: FileEntry?
     private(set) var zipArchive: FileEntry?
+    @ObservationIgnored private var unrecordedArchive: URL?
     var showPreview: Bool {
         get { session.showPreview }
         set { session.showPreview = newValue }
@@ -123,11 +124,11 @@ final class BrowserModel {
     static let home = FileManager.default.homeDirectoryForCurrentUser
     static let defaults: [Place] = [
         Place(name: "个人目录", symbol: "house", url: home),
-        Place(name: "桌面", symbol: "macwindow", url: home.appendingPathComponent("Desktop", isDirectory: true)),
-        Place(name: "文稿", symbol: "doc.text", url: home.appendingPathComponent("Documents", isDirectory: true)),
+        Place(name: "桌面", symbol: "desktopcomputer", url: home.appendingPathComponent("Desktop", isDirectory: true)),
+        Place(name: "文稿", symbol: "doc", url: home.appendingPathComponent("Documents", isDirectory: true)),
         Place(name: "下载", symbol: "arrow.down.to.line", url: home.appendingPathComponent("Downloads", isDirectory: true)),
         Place(name: "图片", symbol: "photo", url: home.appendingPathComponent("Pictures", isDirectory: true)),
-        Place(name: "应用程序", symbol: "square.grid.2x2", url: URL(fileURLWithPath: "/Applications", isDirectory: true))
+        Place(name: "应用程序", symbol: "square.stack.3d.up", url: URL(fileURLWithPath: "/Applications", isDirectory: true))
     ]
 
     init(directory: URL, session: BrowserSession, isStash: Bool = false) {
@@ -489,16 +490,30 @@ final class BrowserModel {
         if entry.isFolder {
             navigate(to: entry.url)
         } else if ZipContents.supports(entry.url) {
+            guard zipArchive?.id != entry.id else { return }
+            unrecordedArchive = entry.id
             zipArchive = entry
         } else {
             openWithDefaultApp(entry)
         }
     }
 
-    func closeZip() { if zipArchive != nil { zipArchive = nil } }
+    func didOpenArchive(_ entry: FileEntry) {
+        guard unrecordedArchive == entry.id else { return }
+        unrecordedArchive = nil
+        session.frequentFiles.recordOpen(entry.url)
+    }
+
+    func closeZip() {
+        unrecordedArchive = nil
+        if zipArchive != nil { zipArchive = nil }
+    }
 
     func openWithDefaultApp(_ entry: FileEntry) {
-        if !NSWorkspace.shared.open(entry.url) {
+        if NSWorkspace.shared.open(entry.url) {
+            if !entry.isFolder { session.frequentFiles.recordOpen(entry.url) }
+        } else {
+            session.frequentFiles.refresh()
             issue = BrowserIssue(title: "无法打开文件", message: entry.name)
         }
     }
@@ -640,6 +655,7 @@ final class BrowserModel {
                 if let history {
                     let changes = session.updateStash(for: outcome.relocations, keepingReferences: history != .trash)
                     session.history.record(history, count: changes.count, detail: location.path, relocations: changes)
+                    session.frequentFiles.relocate(changes, trashing: history == .trash)
                 }
                 onCompletion(outcome)
                 if !outcome.failures.isEmpty { issue = BrowserIssue(title: title, message: outcome.failureSummary) }

@@ -44,7 +44,7 @@ struct PreviewPane: View {
                 ContentUnavailableView("已选 \(model.selectedIDs.count) 项", systemImage: "square.on.square")
                     .frame(maxHeight: .infinity)
             } else {
-                ContentUnavailableView("选择要预览的文件", systemImage: "document.viewfinder")
+                ContentUnavailableView("选择要预览的文件", systemImage: "doc.viewfinder")
                     .frame(maxHeight: .infinity)
             }
         }
@@ -57,9 +57,7 @@ struct PreviewPane: View {
     @ViewBuilder private func surface(_ entry: FileEntry) -> some View {
         if entry.isFolder {
             VStack(spacing: 12) {
-                Image(systemName: "folder.fill")
-                    .font(.system(size: 47))
-                    .foregroundStyle(Color.accentColor)
+                PreviewFileIcon(entry: entry, size: 78)
                     .accessibilityHidden(true)
                 Button("打开文件夹") { openFolder(entry) }
             }
@@ -70,6 +68,8 @@ struct PreviewPane: View {
 
     private func summary(_ entry: FileEntry) -> some View {
         HStack(spacing: 8) {
+            PreviewFileIcon(entry: entry, size: 26)
+                .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 3) {
                 Text(entry.name)
                     .font(.subheadline.weight(.semibold))
@@ -122,11 +122,11 @@ struct FilePreview: View {
     var body: some View {
         Group {
             switch loaded?.entry == entry ? loaded?.data : nil {
-            case .text(let text, let monospaced):
+            case .text(let text, let monospaced, let highlights):
                 if text.isEmpty {
                     Text("空文件").foregroundStyle(.secondary)
                 } else {
-                    TextPreview(entry: entry, text: text, monospaced: monospaced)
+                    TextPreview(entry: entry, text: text, monospaced: monospaced, highlights: highlights)
                 }
             case .paged(let source):
                 PagedPreview(source: source).id(source.id)
@@ -138,9 +138,11 @@ struct FilePreview: View {
             case .pdf(let pdf):
                 PDFPreview(document: pdf.document)
                     .accessibilityLabel("PDF 预览")
-            case .media:
-                MediaPreview(url: entry.url)
+            case .media(let kind):
+                MediaPreview(entry: entry, kind: kind)
                     .id(entry.url)
+            case .applicationIcon:
+                PreviewFileIcon(entry: entry, size: 168).padding(16)
             case .quickLook:
                 EmbeddedQuickLook(url: entry.url)
                     .accessibilityLabel("系统快速预览")
@@ -185,29 +187,69 @@ private struct PDFPreview: NSViewRepresentable {
 }
 
 private struct MediaPreview: View {
-    let url: URL
-    @ViewState private var player: AVPlayer?
-    @ViewState private var unavailable = false
+    let entry: FileEntry
+    let kind: MediaKind
+    @ViewState private var state: State = .loading
+
+    private enum State {
+        case loading
+        case ready(AVPlayer, AVPlayerItem)
+        case unavailable(String)
+    }
 
     var body: some View {
         Group {
-            if let player {
+            switch state {
+            case .ready(let player, let item):
                 NativePlayer(player: player)
                     .accessibilityLabel("媒体预览")
-            } else if unavailable {
-                EmbeddedQuickLook(url: url)
-            } else {
+                    .onReceive(item.publisher(for: \.status).receive(on: DispatchQueue.main)) { status in
+                        if status == .failed { failed(player) }
+                    }
+                    .onReceive(NotificationCenter.default.publisher(for: .AVPlayerItemFailedToPlayToEndTime, object: item)
+                        .receive(on: DispatchQueue.main)) { _ in
+                        failed(player)
+                    }
+            case .unavailable(let title):
+                ContentUnavailableView(title, systemImage: kind.symbol)
+            case .loading:
                 ProgressView().controlSize(.small)
             }
         }
-        .task {
-            let asset = AVURLAsset(url: url)
-            let playable = (try? await asset.load(.isPlayable)) == true
-            guard !Task.isCancelled else { return }
-            if playable { player = AVPlayer(playerItem: AVPlayerItem(asset: asset)) }
-            else { unavailable = true }
+        .task(id: entry) {
+            pause()
+            state = .loading
+            let asset = AVURLAsset(url: entry.url)
+            do {
+                let tracks = try await asset.load(.tracks)
+                try Task.checkCancellation()
+                guard tracks.contains(where: { $0.mediaType == .video || $0.mediaType == .audio || $0.mediaType == .muxed }) else {
+                    state = .unavailable("没有可播放的音视频轨道")
+                    return
+                }
+                let playable = try await asset.load(.isPlayable)
+                try Task.checkCancellation()
+                if playable {
+                    let item = AVPlayerItem(asset: asset)
+                    state = .ready(AVPlayer(playerItem: item), item)
+                } else {
+                    state = .unavailable("无法预览此媒体")
+                }
+            } catch {
+                if !Task.isCancelled { state = .unavailable("无法读取此媒体") }
+            }
         }
-        .onDisappear { player?.pause() }
+        .onDisappear(perform: pause)
+    }
+
+    private func pause() {
+        if case .ready(let player, _) = state { player.pause() }
+    }
+
+    private func failed(_ player: AVPlayer) {
+        guard case .ready(let current, _) = state, current === player else { return }
+        player.pause()
+        state = .unavailable("无法播放此媒体")
     }
 }
 
@@ -231,12 +273,45 @@ private struct NativePlayer: NSViewRepresentable {
     }
 }
 
+private struct PreviewFileIcon: View {
+    let entry: FileEntry
+    let size: CGFloat
+    @ViewState private var requestedEntry: FileEntry?
+    @ViewState private var nativeIcon: NSImage?
+
+    var body: some View {
+        let native = requestedEntry == entry ? nativeIcon : nil
+        Group {
+            if let native {
+                Image(nsImage: native).resizable().scaledToFit()
+            } else if let placeholder = entry.placeholderIcon(size: size) {
+                Image(nsImage: placeholder)
+                    .renderingMode(.template)
+                    .resizable()
+                    .scaledToFit()
+                    .foregroundStyle(Color(nsColor: entry.glyph.tint))
+            }
+        }
+        .frame(width: size, height: size)
+        .accessibilityLabel(entry.iconAccessibilityLabel)
+        .onChange(of: entry, initial: true) {
+            requestedEntry = entry
+            nativeIcon = nil
+            guard entry.hasNativeIcon else { return }
+            FileIcons.shared.load(for: entry) { image in
+                if requestedEntry == entry { nativeIcon = image }
+            }
+        }
+    }
+}
+
 private struct EmbeddedQuickLook: NSViewRepresentable {
     let url: URL
 
     func makeNSView(context: Context) -> QLPreviewView {
         let view = QLPreviewView(frame: .zero, style: .normal)!
         view.autostarts = true
+        view.shouldCloseWithWindow = false
         return view
     }
 
@@ -244,7 +319,10 @@ private struct EmbeddedQuickLook: NSViewRepresentable {
         if view.previewItem?.previewItemURL != url { view.previewItem = url as NSURL }
     }
 
-    static func dismantleNSView(_ view: QLPreviewView, coordinator: ()) { view.close() }
+    static func dismantleNSView(_ view: QLPreviewView, coordinator: ()) {
+        // Close after SwiftUI finishes removing the preview from its view graph.
+        DispatchQueue.main.async { view.close() }
+    }
 }
 
 struct ExpandedPreview: View {

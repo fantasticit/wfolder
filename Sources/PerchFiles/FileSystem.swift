@@ -10,6 +10,7 @@ struct FileEntry: Identifiable, Equatable, Sendable {
     let modified: Date?
     let size: Int?
     let contentType: UTType?
+    let sourceLanguage: SourceLanguage?
 
     var id: URL { url }
     var sizeLabel: String {
@@ -33,11 +34,16 @@ struct FileEntry: Identifiable, Equatable, Sendable {
         let linkTarget = isLink ? try? url.resolvingSymlinksInPath().resourceValues(forKeys: [.isDirectoryKey, .isPackageKey]) : nil
         let isFolder = !isPackage && (info?.isDirectory == true
             || (linkTarget?.isDirectory == true && linkTarget?.isPackage != true))
+        let language = isFolder || isPackage ? nil : SourceLanguage.detect(url)
         let kind: String
         if isLink {
             kind = "符号链接"
         } else if isFolder {
             kind = "文件夹"
+        } else if let language {
+            kind = language.rawValue
+        } else if MediaKind.transportStreams.contains(url.pathExtension.lowercased()) {
+            kind = "MPEG-2 传输流"
         } else if let format = NewFileFormat(rawValue: url.pathExtension.lowercased()) {
             kind = format.title
         } else if isPackage {
@@ -48,7 +54,7 @@ struct FileEntry: Identifiable, Equatable, Sendable {
         return Self(
             url: logicalURL ?? url, name: info?.localizedName ?? filename, filename: filename,
             isFolder: isFolder, kind: kind, modified: info?.contentModificationDate,
-            size: (isFolder || isPackage) ? nil : info?.fileSize, contentType: type
+            size: (isFolder || isPackage) ? nil : info?.fileSize, contentType: type, sourceLanguage: language
         )
     }
 }

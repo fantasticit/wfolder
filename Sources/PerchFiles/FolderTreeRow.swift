@@ -41,7 +41,13 @@ struct FolderTreeRow: View {
             Button {
                 navigate(place.url)
             } label: {
-                Label(place.name, systemImage: place.symbol)
+                Label {
+                    Text(place.name)
+                } icon: {
+                    Image(systemName: place.symbol)
+                        .symbolRenderingMode(.monochrome)
+                        .foregroundStyle(place.id == model.directory.path ? .primary : .secondary)
+                }
                     .fontWeight(place.id == model.directory.path ? .semibold : .regular)
                     .lineLimit(1)
                     .truncationMode(.middle)

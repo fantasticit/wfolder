@@ -360,10 +360,13 @@ private final class FileCell: NSTableCellView {
         didSet { updateColors() }
     }
 
+    private var iconEntry: FileEntry?
+    private var usesNativeIcon = false
+
     private func updateColors() {
         let selected = backgroundStyle == .emphasized
         label.textColor = selected ? .alternateSelectedControlTextColor : field == .name ? .labelColor : .secondaryLabelColor
-        icon.contentTintColor = selected ? .alternateSelectedControlTextColor : tint
+        icon.contentTintColor = usesNativeIcon ? nil : selected ? .alternateSelectedControlTextColor : tint
         locationLabel?.textColor = selected ? .alternateSelectedControlTextColor : .secondaryLabelColor
     }
 
@@ -371,10 +374,19 @@ private final class FileCell: NSTableCellView {
         switch field {
         case .name:
             label.stringValue = entry.displayName(showExtensions: showExtensions)
-            let glyph = entry.glyph
-            icon.image = NSImage(systemSymbolName: glyph.symbol, accessibilityDescription: nil)?
-                .withSymbolConfiguration(.init(pointSize: 15, weight: .medium))
-            tint = glyph.tint
+            icon.image = entry.placeholderIcon(size: 17)
+            tint = entry.glyph.tint
+            iconEntry = entry.hasNativeIcon ? entry : nil
+            usesNativeIcon = false
+            icon.setAccessibilityLabel(entry.iconAccessibilityLabel)
+            if entry.hasNativeIcon {
+                FileIcons.shared.load(for: entry) { [weak self] image in
+                    guard let self, self.iconEntry == entry else { return }
+                    self.usesNativeIcon = true
+                    self.icon.image = image
+                    self.updateColors()
+                }
+            }
             updateColors()
             let path = entry.url.deletingLastPathComponent().path
             if let locationLabel {

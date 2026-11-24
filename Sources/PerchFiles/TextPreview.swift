@@ -5,6 +5,7 @@ struct TextPreview: NSViewRepresentable {
     let entry: FileEntry
     let text: String
     let monospaced: Bool
+    let highlights: [SyntaxSpan]
 
     final class Coordinator {
         var entry: FileEntry?
@@ -47,9 +48,15 @@ struct TextPreview: NSViewRepresentable {
         guard let view = scroll.documentView as? NSTextView,
               context.coordinator.entry != entry else { return }
         context.coordinator.entry = entry
-        view.font = monospaced ? .monospacedSystemFont(ofSize: 12, weight: .regular) : .systemFont(ofSize: 12)
+        let font = monospaced ? NSFont.monospacedSystemFont(ofSize: 12, weight: .regular) : .systemFont(ofSize: 12)
+        view.font = font
         view.textColor = .labelColor
-        view.string = text
+        if highlights.isEmpty {
+            view.string = text
+        } else {
+            view.textStorage?.setAttributedString(SyntaxColors.attributed(text, spans: highlights, font: font))
+        }
+        view.setAccessibilityLabel(entry.sourceLanguage == nil ? "文本预览" : "代码预览")
         view.setSelectedRange(NSRange(location: 0, length: 0))
         scroll.contentView.scroll(to: .zero)
         scroll.reflectScrolledClipView(scroll.contentView)
