@@ -130,6 +130,10 @@ struct FilePreview: View {
                 }
             case .paged(let source):
                 PagedPreview(source: source).id(source.id)
+            case .workbook(let workbook):
+                XLSXPreview(workbook: workbook).id(workbook.id)
+            case .workbookError(let message):
+                ContentUnavailableView("无法预览 Excel 工作簿", systemImage: "tablecells", description: Text(message))
             case .image(let image):
                 Image(decorative: image, scale: 1, orientation: .up)
                     .resizable()

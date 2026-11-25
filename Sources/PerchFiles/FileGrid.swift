@@ -78,9 +78,7 @@ struct FileGrid: NSViewRepresentable {
             coordinator.showsLocation = showsLocation
             coordinator.showExtensions = showExtensions
             if dataChanged { grid.selectionAnchor = nil }
-            layout.itemSize = mode == .large
-                ? NSSize(width: 156, height: showsLocation ? 166 : 150)
-                : NSSize(width: 112, height: showsLocation ? 130 : 114)
+            layout.itemSize = FileGridItem.size(for: mode, showsLocation: showsLocation)
             grid.reloadData()
         }
         if directoryChanged {
@@ -426,7 +424,14 @@ private final class FileGridPicture: NSImageView {
 
 private final class FileGridItem: NSCollectionViewItem {
     static let identifier = NSUserInterfaceItemIdentifier("FileGridItem")
-    private let nameLabel = NSTextField(labelWithString: "")
+    private static let horizontalPadding: CGFloat = 7
+
+    static func size(for mode: FileViewMode, showsLocation: Bool) -> NSSize {
+        let large = mode == .large
+        return NSSize(width: large ? 156 : 120, height: (large ? 182 : 146) + (showsLocation ? 16 : 0))
+    }
+
+    private let nameLabel = NSTextField(wrappingLabelWithString: "")
     private let kindLabel = NSTextField(labelWithString: "")
     private let location = NSTextField(labelWithString: "")
     private let picture = FileGridPicture()
@@ -442,11 +447,16 @@ private final class FileGridItem: NSCollectionViewItem {
         picture.imageScaling = .scaleProportionallyDown
         pictureHeight = picture.heightAnchor.constraint(equalToConstant: 62)
         nameLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        nameLabel.alignment = .center
+        nameLabel.maximumNumberOfLines = 3
+        nameLabel.lineBreakMode = .byWordWrapping
+        nameLabel.cell?.truncatesLastVisibleLine = true
+        nameLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         kindLabel.font = .systemFont(ofSize: 10)
         kindLabel.textColor = .secondaryLabelColor
         location.font = .systemFont(ofSize: 10)
         location.textColor = .secondaryLabelColor
-        for label in [nameLabel, kindLabel, location] {
+        for label in [kindLabel, location] {
             label.alignment = .center
             label.maximumNumberOfLines = 1
             label.lineBreakMode = .byTruncatingMiddle
@@ -459,8 +469,8 @@ private final class FileGridItem: NSCollectionViewItem {
         stack.translatesAutoresizingMaskIntoConstraints = false
         tile.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: tile.leadingAnchor, constant: 7),
-            stack.trailingAnchor.constraint(equalTo: tile.trailingAnchor, constant: -7),
+            stack.leadingAnchor.constraint(equalTo: tile.leadingAnchor, constant: Self.horizontalPadding),
+            stack.trailingAnchor.constraint(equalTo: tile.trailingAnchor, constant: -Self.horizontalPadding),
             stack.topAnchor.constraint(equalTo: tile.topAnchor, constant: 8),
             picture.widthAnchor.constraint(equalTo: stack.widthAnchor),
             pictureHeight,
@@ -497,13 +507,34 @@ private final class FileGridItem: NSCollectionViewItem {
                 self.picture.image = image
             }
         }
+        nameLabel.preferredMaxLayoutWidth = Self.size(for: mode, showsLocation: showsLocation).width
+            - 2 * Self.horizontalPadding
         nameLabel.stringValue = entry.displayName(showExtensions: showExtensions)
         kindLabel.stringValue = entry.kind
         let path = entry.url.deletingLastPathComponent().path
         location.isHidden = !showsLocation
         location.stringValue = showsLocation ? (path as NSString).abbreviatingWithTildeInPath : ""
-        view.toolTip = showsLocation ? entry.filename + "\n" + path : entry.filename
+        let fullName = entry.filename
+        let help = showsLocation ? fullName + "\n" + path : fullName
+        let wrappedName = Self.wrapTooltip(fullName)
+        let tooltip = showsLocation ? wrappedName + "\n" + Self.wrapTooltip(path) : wrappedName
+        for target in [view, picture, nameLabel, kindLabel, location] {
+            target.toolTip = tooltip
+        }
+        nameLabel.setAccessibilityHelp(help)
+        picture.setAccessibilityHelp(help)
         applySelection()
+    }
+
+    private static func wrapTooltip(_ text: String) -> String {
+        var lines: [Substring] = []
+        var start = text.startIndex
+        while start < text.endIndex {
+            let end = text.index(start, offsetBy: 48, limitedBy: text.endIndex) ?? text.endIndex
+            lines.append(text[start..<end])
+            start = end
+        }
+        return lines.joined(separator: "\n")
     }
 
     func showThumbnail(_ thumbnail: GridThumbnail, key: String) {

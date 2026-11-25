@@ -99,6 +99,7 @@ struct BrowserFileActions {
                 workspace.presentedTool = .batchRename(model, items)
             })
         }
+        menu.addItem(airDropItem(for: items))
         menu.addItem(action("加入暂存架", "tray.and.arrow.down") { workspace.storeInStash(items.map(\.url)) })
         menu.addItem(action("剪切", "scissors", enabled: model.canQueueTransfer) { self.model.copy(items, cut: true) })
         menu.addItem(action("复制", "doc.on.doc") { self.model.copy(items) })
@@ -146,6 +147,7 @@ struct BrowserFileActions {
             menu.addItem(.separator())
         }
         guard !urls.isEmpty else { return menu }
+        menu.addItem(airDropItem(for: items))
         menu.addItem(action("复制", "doc.on.doc") { model.copy(items) })
         let targets = workspace.transferTargets(from: model)
         if !targets.isEmpty {
@@ -154,6 +156,10 @@ struct BrowserFileActions {
         }
         menu.addItem(action("移出暂存架", "tray.and.arrow.up") { workspace.removeFromStash(urls) })
         return menu
+    }
+
+    private func airDropItem(for items: [FileEntry]) -> NSMenuItem {
+        action("隔空投送…", "airdrop") { model.sendViaAirDrop(items) }
     }
 
     private func addTransfer(_ operation: PaneTransferOperation, targets: [BrowserWorkspace.TransferTarget],

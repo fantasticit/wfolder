@@ -22,7 +22,7 @@ struct PerchFilesApp: App {
     var body: some Scene {
         Window("wfolder", id: "browser") {
             BrowserView(directory: Self.startingDirectory, restoresSession: Self.startingDirectory == nil) {
-                delegate.workspace = $0
+                delegate.attachWorkspace($0)
             }
             .frame(minWidth: 920, minHeight: 510)
         }
@@ -41,8 +41,51 @@ struct PerchFilesApp: App {
     }
 }
 
+@MainActor
 final class PerchDelegate: NSObject, NSApplicationDelegate {
-    weak var workspace: BrowserWorkspace?
+    private weak var workspace: BrowserWorkspace?
+    private var pendingFinderItems: [BrowserAddress] = []
+
+    func attachWorkspace(_ workspace: BrowserWorkspace) {
+        self.workspace = workspace
+        guard !pendingFinderItems.isEmpty else { return }
+        let items = pendingFinderItems
+        pendingFinderItems.removeAll()
+        DispatchQueue.main.async { [weak self] in self?.openFinderItems(items) }
+    }
+
+    @objc(openInWfolder:userData:error:)
+    func openInWfolder(_ pasteboard: NSPasteboard, userData: String?,
+                       error: AutoreleasingUnsafeMutablePointer<NSString?>?) {
+        var urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+        if urls.isEmpty, let paths = pasteboard.propertyList(forType: NSPasteboard.PasteboardType("NSFilenamesPboardType")) as? [String] {
+            urls = paths.map { URL(fileURLWithPath: $0) }
+        }
+        guard !urls.isEmpty else {
+            error?.pointee = "找不到 Finder 选中的文件或文件夹。"
+            return
+        }
+        let selectedURLs = urls
+        Task {
+            let items = await Task.detached(priority: .userInitiated) {
+                selectedURLs.compactMap { BrowserAddress.resolve(fileURL: $0, packagesAsFiles: true) }
+            }.value
+            if !items.isEmpty { openFinderItems(items) }
+        }
+    }
+
+    private func openFinderItems(_ items: [BrowserAddress]) {
+        guard let workspace else {
+            pendingFinderItems.append(contentsOf: items)
+            return
+        }
+        workspace.openFinderItems(items)
+        NSApp.activate()
+        if let window = NSApp.windows.first(where: { $0.identifier?.rawValue == "browser" }) {
+            if window.isMiniaturized { window.deminiaturize(nil) }
+            window.makeKeyAndOrderFront(nil)
+        }
+    }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let workspace, workspace.hasFileMutations else { return .terminateNow }
@@ -56,6 +99,8 @@ final class PerchDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        NSApp.servicesProvider = self
+        NSUpdateDynamicServices()
         NSApp.activate(ignoringOtherApps: true)
     }
 }
@@ -89,6 +134,10 @@ private struct BrowserCommands: Commands {
             }
             .keyboardShortcut("o")
             .disabled(browser?.selected == nil)
+            Button("隔空投送…") {
+                if let browser { browser.sendViaAirDrop(browser.selectedEntries) }
+            }
+            .disabled(browser?.selectedIDs.isEmpty != false)
             Button("重命名所选项目") {
                 if let browser, let entry = browser.selected { browser.askRename(entry) }
             }

@@ -49,12 +49,34 @@ struct PreviewCell: Sendable {
     }
 }
 
-struct PagedPreviewSource: Sendable {
+protocol PreviewGridSource: Sendable {
+    var id: UUID { get }
+    var isTable: Bool { get }
+    var isMonospaced: Bool { get }
+    var language: SourceLanguage? { get }
+    func textWidth(for units: Int) -> CGFloat
+    func scan(_ publish: @escaping (PreviewIndexBatch) -> Void) throws
+    func readPage(at start: PreviewPageStart, block: Int) throws -> [[PreviewCell]]
+}
+
+extension PreviewGridSource {
+    var isMonospaced: Bool { false }
+    var language: SourceLanguage? { nil }
+    func textWidth(for units: Int) -> CGFloat { 0 }
+}
+
+struct PagedPreviewSource: PreviewGridSource {
     static let pageRows = 128
     static let blockColumns = 16
 
     let id = UUID()
     let mode: PreviewPageMode
+    var isTable: Bool { mode.isTable }
+    var language: SourceLanguage? { mode.language }
+    var isMonospaced: Bool {
+        if case .text(let monospaced, _) = mode { return monospaced }
+        return false
+    }
     private let file: PreviewFile
     private let encoding: PreviewEncoding
     private let start: UInt64
@@ -96,7 +118,7 @@ struct PagedPreviewSource: Sendable {
         return encoding.decode(Data(bytes.dropFirst(Int(start))))
     }
 
-    func scan(_ publish: (PreviewIndexBatch) -> Void) throws {
+    func scan(_ publish: @escaping (PreviewIndexBatch) -> Void) throws {
         let reader = PreviewRecordReader(file: file, encoding: encoding, offset: start)
         var pages: [PreviewPageStart] = []
         let syntax = mode.language.map(CodeSyntax.forLanguage)

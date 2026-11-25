@@ -116,7 +116,7 @@ final class BrowserModel {
     @ObservationIgnored private var completedSearch: FolderSearchResults?
     @ObservationIgnored private var groupTask: Task<GroupedFileRows, Error>?
     @ObservationIgnored private var pendingReveal: Set<String> = []
-    @ObservationIgnored private var explicitlyRevealedFile: URL?
+    @ObservationIgnored private var explicitlyRevealedFiles: [URL] = []
     @ObservationIgnored private var watcher: DispatchSourceFileSystemObject?
     @ObservationIgnored private var watchRefresh: Task<Void, Never>?
     private let session: BrowserSession
@@ -264,7 +264,7 @@ final class BrowserModel {
         select([])
         pendingReveal = []
         clearSearch()
-        explicitlyRevealedFile = item
+        explicitlyRevealedFiles = item.map { [$0] } ?? []
         loadError = nil
         watchLocation()
         refresh(revealing: item.map { [$0] } ?? [])
@@ -301,8 +301,12 @@ final class BrowserModel {
             return
         }
         // An explicit path can point to a hidden item while hidden items are filtered out.
-        explicitlyRevealedFile = url
-        refresh(revealing: [url])
+        revealItems(inCurrentFolder: [url])
+    }
+
+    func revealItems(inCurrentFolder urls: [URL]) {
+        explicitlyRevealedFiles = urls
+        refresh(revealing: urls)
     }
 
     private func clearSearch() {
@@ -320,7 +324,7 @@ final class BrowserModel {
         let url = directory
         let stash = isStash ? session.stash : nil
         let showHidden = session.showHidden
-        let explicitlyRevealedFile = self.explicitlyRevealedFile
+        let explicitlyRevealedFiles = self.explicitlyRevealedFiles
         let sortColumn = self.sortColumn
         let ascending = self.ascending
         let query = self.query
@@ -333,9 +337,16 @@ final class BrowserModel {
                     return FileEntry.read(URL(fileURLWithPath: url.path, isDirectory: url.hasDirectoryPath))
                 }
             } ?? FileSystem.list(url, showHidden: showHidden)
-            if let item = explicitlyRevealedFile, !files.contains(where: { $0.url.path == item.path }),
-               FileManager.default.fileExists(atPath: item.path) {
-                files.append(FileEntry.read(item))
+            if !explicitlyRevealedFiles.isEmpty {
+                var missingPaths = Set(explicitlyRevealedFiles.map(\.path))
+                for file in files {
+                    missingPaths.remove(file.url.path)
+                    if missingPaths.isEmpty { break }
+                }
+                for item in explicitlyRevealedFiles where missingPaths.remove(item.path) != nil {
+                    try Task.checkCancellation()
+                    if FileManager.default.fileExists(atPath: item.path) { files.append(FileEntry.read(item)) }
+                }
             }
             try Task.checkCancellation()
             let sorted = Self.sorted(files, by: sortColumn, ascending: ascending)
@@ -525,6 +536,17 @@ final class BrowserModel {
             session.frequentFiles.refresh()
             issue = BrowserIssue(title: "无法打开文件", message: entry.name)
         }
+    }
+
+    func sendViaAirDrop(_ entries: [FileEntry]) {
+        let urls = entries.map(\.url)
+        guard !urls.isEmpty else { return }
+        guard let service = NSSharingService(named: .sendViaAirDrop),
+              service.canPerform(withItems: urls) else {
+            issue = BrowserIssue(title: "无法使用隔空投送", message: "macOS 无法通过隔空投送发送当前选中的项目。")
+            return
+        }
+        service.perform(withItems: urls)
     }
 
     func extractZip(_ archive: FileEntry, paths: Set<String>, folder: String, into destination: URL,

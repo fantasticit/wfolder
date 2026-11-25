@@ -314,6 +314,33 @@ final class BrowserWorkspace {
         activeBrowser.revealItem(at: url)
     }
 
+    func openFinderItems(_ items: [BrowserAddress]) {
+        var directories: [URL] = []
+        var selections: [URL: [URL]] = [:]
+        for item in items {
+            let directory: URL
+            let file: URL?
+            switch item {
+            case .folder(let url): (directory, file) = (url, nil)
+            case .file(let url): (directory, file) = (url.deletingLastPathComponent(), url)
+            }
+            if selections[directory] == nil {
+                directories.append(directory)
+                selections[directory] = []
+            }
+            if let file { selections[directory, default: []].append(file) }
+        }
+
+        for directory in directories {
+            openTab(at: directory)
+            if let files = selections[directory], !files.isEmpty {
+                activeBrowser.revealItems(inCurrentFolder: files)
+                activeBrowser.showPreview = true
+            }
+        }
+        paneFocusRequest += 1
+    }
+
     func followAddress(_ address: BrowserAddress) {
         if let browser = directoryBrowser {
             activatePane(browser)

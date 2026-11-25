@@ -17,9 +17,18 @@ enum BrowserAddress: Sendable {
             let path = (input as NSString).expandingTildeInPath
             url = URL(fileURLWithPath: path, isDirectory: false, relativeTo: directory)
         }
-        let target = url.standardizedFileURL
+        return resolve(fileURL: url)
+    }
+
+    static func resolve(fileURL: URL, packagesAsFiles: Bool = false) -> Self? {
+        guard fileURL.isFileURL, !fileURL.path.utf8.contains(0) else { return nil }
+        let target = fileURL.standardizedFileURL
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: target.path, isDirectory: &isDirectory) else { return nil }
+        if isDirectory.boolValue, packagesAsFiles,
+           (try? target.resolvingSymlinksInPath().resourceValues(forKeys: [.isPackageKey]).isPackage) == true {
+            return .file(target)
+        }
         let resolved = URL(fileURLWithPath: target.path, isDirectory: isDirectory.boolValue)
         return isDirectory.boolValue ? .folder(resolved) : .file(resolved)
     }

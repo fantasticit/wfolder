@@ -11,6 +11,8 @@ struct PreparedPDF: @unchecked Sendable {
 enum PreviewData: Sendable {
     case text(String, monospaced: Bool, highlights: [SyntaxSpan])
     case paged(PagedPreviewSource)
+    case workbook(XLSXWorkbook)
+    case workbookError(String)
     case image(CGImage)
     case pdf(PreparedPDF)
     case media(MediaKind)
@@ -28,6 +30,10 @@ enum PreviewData: Sendable {
         guard !Task.isCancelled else { return .quickLook }
         let ext = url.pathExtension.lowercased()
         let type = entry.contentType
+        if ext == "xlsx" || type?.identifier == "org.openxmlformats.spreadsheetml.sheet" {
+            do { return .workbook(try XLSXWorkbook.read(url)) }
+            catch { return .workbookError(error.localizedDescription) }
+        }
         if let language = entry.sourceLanguage {
             return loadText(url, ext: ext, mode: .text(monospaced: true, language: language))
         }
@@ -38,7 +44,7 @@ enum PreviewData: Sendable {
         }
         if let mediaKind = entry.mediaKind { return .media(mediaKind) }
         if [
-            "doc", "docx", "xls", "xlsx", "ppt", "pptx", "pages", "numbers", "key", "rtf", "rtfd",
+            "doc", "docx", "xls", "ppt", "pptx", "pages", "numbers", "key", "rtf", "rtfd",
             "svg", "gif"
         ].contains(ext) { return .quickLook }
 

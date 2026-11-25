@@ -60,13 +60,7 @@ struct ZipContents: Sendable {
                 try fm.createDirectory(at: target, withIntermediateDirectories: true)
             } else {
                 try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
-                let fd = target.withUnsafeFileSystemRepresentation { path -> Int32 in
-                    guard let path else { return -1 }
-                    return Darwin.open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
-                }
-                guard fd >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
-                defer { close(fd) }
-                guard archive_read_data_into_fd(reader, fd) == 0 else { throw error(reader) }
+                try writeMember(reader, to: target)
             }
             extracted.insert(prefix + String(first))
         }
@@ -87,6 +81,28 @@ struct ZipContents: Sendable {
             throw error
         }
         return published.map(\.output)
+    }
+
+    static func copyParts(_ paths: [String: URL], from archive: URL, maxPartBytes: Int64) throws {
+        var remaining = paths
+        try read(archive) { reader, member in
+            guard let member, !member.isDirectory, let target = remaining.removeValue(forKey: member.path) else { return }
+            guard let size = member.size, size >= 0, size <= maxPartBytes else {
+                throw ZipError.couldNotRead("工作簿的压缩内容超出预览大小限制。")
+            }
+            try writeMember(reader, to: target)
+        }
+        if !remaining.isEmpty { throw ZipError.couldNotRead("工作簿缺少必要的内容。") }
+    }
+
+    private static func writeMember(_ reader: OpaquePointer, to target: URL) throws {
+        let fd = target.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return Darwin.open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
+        }
+        guard fd >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        defer { close(fd) }
+        guard archive_read_data_into_fd(reader, fd) == 0 else { throw error(reader) }
     }
 
     private static func read(_ url: URL, each: (OpaquePointer, Member?) throws -> Void) throws {
