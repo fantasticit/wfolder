@@ -275,6 +275,15 @@ final class BrowserModel {
         loadListing()
     }
 
+    func followAddress(_ address: BrowserAddress) {
+        switch address {
+        case .folder(let url): navigate(to: url)
+        case .file(let url):
+            revealItem(at: url)
+            showPreview = true
+        }
+    }
+
     func showContainingFolder(of entry: FileEntry) {
         revealItem(at: entry.url)
     }

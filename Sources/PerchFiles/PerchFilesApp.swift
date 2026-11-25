@@ -165,9 +165,9 @@ private struct BrowserCommands: Commands {
             Button("编辑地址") { workspace?.focusAddress() }
                 .keyboardShortcut("l")
                 .disabled(browser?.isStash != false)
-            Button("前往文件夹…") { workspace?.focusAddress() }
+            Button("前往路径…") { workspace?.presentedTool = .goToPath }
                 .keyboardShortcut("g", modifiers: [.command, .shift])
-                .disabled(browser?.isStash != false)
+                .disabled(workspace == nil)
         }
         CommandGroup(before: .windowArrangement) {
             Button("下一个标签页") { workspace?.selectAdjacentTab(forward: true) }

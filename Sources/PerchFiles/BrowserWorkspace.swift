@@ -314,6 +314,21 @@ final class BrowserWorkspace {
         activeBrowser.revealItem(at: url)
     }
 
+    func followAddress(_ address: BrowserAddress) {
+        if let browser = directoryBrowser {
+            activatePane(browser)
+            browser.followAddress(address)
+        } else {
+            switch address {
+            case .folder(let url): navigateToFolder(url)
+            case .file(let url):
+                revealInFolder(url)
+                activeBrowser.showPreview = true
+            }
+        }
+        paneFocusRequest += 1
+    }
+
     private func insertPane(_ pane: BrowserModel, beside current: BrowserModel, direction: PaneSplitDirection) {
         tabs[activeIndex].layout = activeTab.layout.inserting(pane, beside: current.id, direction: direction)
         tabs[activeIndex].focusedPaneID = pane.id

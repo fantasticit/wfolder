@@ -78,6 +78,10 @@ struct BrowserView: View {
                 BatchRenameView(browser: browser, entries: entries) { workspace.presentedTool = nil }
             case .compare: FolderCompareView(workspace: workspace)
             case .spotlight: SpotlightSearchView(workspace: workspace)
+            case .goToPath:
+                GoToPathSheet(baseDirectory: workspace.directoryBrowser?.directory ?? model.directory) {
+                    workspace.followAddress($0)
+                }
             }
         }
         .alert(item: $model.issue) { issue in
