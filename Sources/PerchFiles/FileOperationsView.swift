@@ -22,6 +22,8 @@ struct FileOperationsView: View {
                     .labelStyle(.iconOnly)
                     .buttonStyle(.borderless)
             }
+            .fixedSize(horizontal: false, vertical: true)
+
             switch workspace.operationsTab {
             case .transfers:
                 if let job = workspace.transfers.conflictJob {
@@ -40,13 +42,14 @@ struct FileOperationsView: View {
             }
         }
         .padding(16)
-        .frame(width: 630, height: 440)
+        .frame(width: 630, height: 440, alignment: .topLeading)
         .onChange(of: workspace.transfers.conflictJob?.reviewID) { showsReview = true }
     }
 
     @ViewBuilder private var transferList: some View {
         if workspace.transfers.jobs.isEmpty {
             ContentUnavailableView("暂无传输任务", systemImage: "arrow.left.arrow.right")
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             List(workspace.transfers.jobs.reversed()) { job in
                 TransferJobRow(workspace: workspace, job: job)
@@ -60,6 +63,7 @@ struct FileOperationsView: View {
         VStack(alignment: .leading, spacing: 8) {
             if workspace.history.entries.isEmpty {
                 ContentUnavailableView("暂无操作记录", systemImage: "clock.arrow.circlepath")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 List(workspace.history.entries) { entry in
                     VStack(alignment: .leading, spacing: 3) {

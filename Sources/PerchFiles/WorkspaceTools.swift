@@ -2,7 +2,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 enum WorkspaceTool: Identifiable {
-    case workspaces, batchRename(BrowserModel, [FileEntry]), compare, spotlight
+    case workspaces, batchRename(BrowserModel, [FileEntry]), compare, spotlight, goToPath
 
     var id: String {
         switch self {
@@ -10,6 +10,7 @@ enum WorkspaceTool: Identifiable {
         case .batchRename: return "rename"
         case .compare: return "compare"
         case .spotlight: return "spotlight"
+        case .goToPath: return "goToPath"
         }
     }
 }

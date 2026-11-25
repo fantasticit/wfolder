@@ -33,7 +33,10 @@ struct BrowserView: View {
                 }
         }
         .focusedSceneValue(\.browserWorkspace, workspace)
-        .onAppear { onWorkspaceReady(workspace) }
+        .onAppear {
+            onWorkspaceReady(workspace)
+            workspace.frequentFiles.refresh()
+        }
         .task(id: workspace.snapshot) {
             guard restoresSession else { return }
             do { try await Task.sleep(for: .milliseconds(220)) } catch { return }
@@ -53,6 +56,7 @@ struct BrowserView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             workspace.refreshClipboard()
+            workspace.frequentFiles.refresh()
             for browser in workspace.activeTab.browsers where !browser.busy {
                 browser.refreshIfStarted()
             }
@@ -74,6 +78,10 @@ struct BrowserView: View {
                 BatchRenameView(browser: browser, entries: entries) { workspace.presentedTool = nil }
             case .compare: FolderCompareView(workspace: workspace)
             case .spotlight: SpotlightSearchView(workspace: workspace)
+            case .goToPath:
+                GoToPathSheet(baseDirectory: workspace.directoryBrowser?.directory ?? model.directory) {
+                    workspace.followAddress($0)
+                }
             }
         }
         .alert(item: $model.issue) { issue in
@@ -89,7 +97,7 @@ struct BrowserView: View {
     private var sidebar: some View {
         let directoryModel = workspace.directoryBrowser ?? model
         let favorites = model.favorites.map { url in
-            Place(name: BrowserModel.placeName(for: url), symbol: "star", url: url)
+            Place(name: BrowserModel.placeName(for: url), symbol: "folder", url: url)
         }
         let shortcuts = BrowserModel.defaults.filter { !model.isFavorite($0.url) }
         let disk = Place(name: "本机磁盘", symbol: "internaldrive", url: URL(fileURLWithPath: "/", isDirectory: true))
@@ -107,6 +115,24 @@ struct BrowserView: View {
             } header: {
                 Text("常用位置").background(OverlayScrollIndicators())
             }
+            if !workspace.frequentFiles.items.isEmpty {
+                Section("经常访问") {
+                    ForEach(workspace.frequentFiles.items) { item in
+                        let file = item.file
+                        Button { workspace.activeBrowser.openEntry(file) } label: {
+                            sidebarLabel(file.name, symbol: file.glyph.symbol)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                        .buttonStyle(.plain)
+                        .help(file.url.path)
+                        .contextMenu {
+                            Button("前往所在文件夹") { workspace.revealInFolder(file.url) }
+                            Button("从经常访问移除") { workspace.frequentFiles.remove(item) }
+                        }
+                    }
+                }
+            }
             if !favorites.isEmpty {
                 Section("收藏") {
                     ForEach(favorites) { place in
@@ -121,7 +147,7 @@ struct BrowserView: View {
             Section {
                 Button { workspace.openStashPane() } label: {
                     HStack {
-                        Label("文件暂存架", systemImage: "tray")
+                        sidebarLabel("文件暂存架", symbol: "tray")
                         Spacer()
                         if !workspace.stash.isEmpty {
                             Text("\(workspace.stash.count)").font(.caption).foregroundStyle(.secondary)
@@ -137,13 +163,23 @@ struct BrowserView: View {
         .safeAreaInset(edge: .bottom, spacing: 0) {
             HStack {
                 Button(action: chooseFolder) {
-                    Label("选取文件夹…", systemImage: "folder")
+                    sidebarLabel("选取文件夹…", symbol: "folder.badge.plus")
                 }
                 .buttonStyle(.borderless)
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, 15)
             .padding(.vertical, 12)
+        }
+    }
+
+    private func sidebarLabel(_ title: String, symbol: String) -> some View {
+        Label {
+            Text(title)
+        } icon: {
+            Image(systemName: symbol)
+                .symbolRenderingMode(.monochrome)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -181,7 +217,7 @@ struct BrowserView: View {
             Button("复制", systemImage: "doc.on.doc") { model.copy(model.selectedEntries) }
                 .disabled(model.selectedIDs.isEmpty)
                 .help("复制（⌘C）")
-            Button("粘贴", systemImage: "clipboard") { model.paste() }
+            Button("粘贴", systemImage: "doc.on.clipboard") { model.paste() }
                 .disabled(!model.canPaste)
                 .help("粘贴到当前文件夹（⌘V）")
             if model.isStash {
@@ -211,16 +247,6 @@ struct BrowserView: View {
                 FileOperationsView(workspace: workspace)
             }
             Menu {
-                Button("保存或打开工作区…", systemImage: "rectangle.split.2x1") { workspace.presentedTool = .workspaces }
-                Button("文件暂存架", systemImage: "tray", action: workspace.openStashPane)
-                Button("对比面板目录…", systemImage: "arrow.left.arrow.right") { workspace.presentedTool = .compare }
-                    .disabled(workspace.folderBrowsers.count < 2)
-                Button("Spotlight 搜索…", systemImage: "magnifyingglass") { workspace.presentedTool = .spotlight }
-            } label: {
-                Label("工作区工具", systemImage: "square.grid.2x2")
-            }
-            .help("工作区、暂存架、目录对比和 Spotlight 搜索")
-            Menu {
                 Button("左右分割面板", systemImage: "rectangle.split.2x1") { workspace.splitPane(.sideBySide) }
                 Button("上下分割面板", systemImage: "rectangle.split.1x2") { workspace.splitPane(.stacked) }
                 Divider()
@@ -230,6 +256,16 @@ struct BrowserView: View {
                 Label("分割面板", systemImage: "rectangle.split.2x1")
             }
             .help("分割当前面板（⌘D / ⇧⌘D）")
+            Menu {
+                Button("保存或打开工作区…", systemImage: "briefcase") { workspace.presentedTool = .workspaces }
+                Button("文件暂存架", systemImage: "tray", action: workspace.openStashPane)
+                Button("对比面板目录…", systemImage: "arrow.left.arrow.right") { workspace.presentedTool = .compare }
+                    .disabled(workspace.folderBrowsers.count < 2)
+                Button("Spotlight 搜索…", systemImage: "magnifyingglass") { workspace.presentedTool = .spotlight }
+            } label: {
+                Label("工作区工具", systemImage: "briefcase")
+            }
+            .help("工作区、暂存架、目录对比和 Spotlight 搜索")
             Button {
                 model.showPreview.toggle()
             } label: {
@@ -692,7 +728,7 @@ private struct PromptView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Label(prompt.title, systemImage: isTrash ? "trash" : format != nil ? "document.badge.plus" : "folder")
+            Label(prompt.title, systemImage: isTrash ? "trash" : format != nil ? "doc.badge.plus" : "folder")
                 .font(.title3.weight(.semibold))
             if let trashCount {
                 Text(trashCount == 1 ? "将「\(prompt.initial)」移到废纸篓？" : "将选中的 \(trashCount) 项移到废纸篓？")

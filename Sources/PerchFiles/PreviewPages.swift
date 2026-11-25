@@ -3,7 +3,12 @@ import Foundation
 
 enum PreviewPageMode: Sendable {
     case delimited(separator: UInt16)
-    case text(monospaced: Bool)
+    case text(monospaced: Bool, language: SourceLanguage? = nil)
+
+    var language: SourceLanguage? {
+        if case .text(_, let language) = self { return language }
+        return nil
+    }
 
     var isTable: Bool {
         if case .delimited = self { return true }
@@ -11,8 +16,13 @@ enum PreviewPageMode: Sendable {
     }
 }
 
+struct PreviewPageStart: Sendable {
+    let offset: UInt64
+    let syntaxState: SyntaxDelimiter?
+}
+
 struct PreviewIndexBatch: Sendable {
-    let offsets: [UInt64]
+    let pages: [PreviewPageStart]
     let rows: Int
     let columns: Int
     let textUnits: Int
@@ -22,6 +32,7 @@ struct PreviewIndexBatch: Sendable {
 struct PreviewCell: Sendable {
     let value: String
     let display: String
+    var highlights: [SyntaxSpan] = []
 
     init(_ value: String, singleLine: Bool) {
         self.value = value
@@ -62,6 +73,23 @@ struct PagedPreviewSource: Sendable {
         self.sample = sample
     }
 
+    static func isTypeScriptText(_ url: URL) -> Bool {
+        guard let file = try? PreviewFile(url),
+              let sample = try? file.read(at: 0, count: 4096) else { return false }
+        // A stream usually has a sync byte at each packet boundary, including Blu-ray's timestamp framing.
+        for (offset, stride) in [(0, 188), (4, 192), (0, 204)] where sample.count > offset + 2 * stride {
+            if (0..<3).allSatisfy({ sample[offset + $0 * stride] == 0x47 }) { return false }
+        }
+        guard let (encoding, start) = PreviewEncoding.detect(sample, partial: UInt64(sample.count) < file.size) else {
+            return false
+        }
+        let text = encoding.decode(Data(sample.dropFirst(Int(start))))
+        return text.unicodeScalars.allSatisfy {
+            $0.value == 9 || $0.value == 10 || $0.value == 12 || $0.value == 13
+                || ($0.value >= 32 && !(0x7f...0x9f).contains($0.value))
+        }
+    }
+
     func smallText() throws -> String? {
         guard !mode.isTable, file.size <= 256 * 1024 else { return nil }
         let bytes = UInt64(sample.count) == file.size ? sample : try file.read(at: 0, count: Int(file.size))
@@ -70,7 +98,10 @@ struct PagedPreviewSource: Sendable {
 
     func scan(_ publish: (PreviewIndexBatch) -> Void) throws {
         let reader = PreviewRecordReader(file: file, encoding: encoding, offset: start)
-        var offsets: [UInt64] = []
+        var pages: [PreviewPageStart] = []
+        let syntax = mode.language.map(CodeSyntax.forLanguage)
+        var state: SyntaxDelimiter?
+        var pageText = ""
         var rows = 0
         var columns = 0
         var textUnits = 0
@@ -78,35 +109,75 @@ struct PagedPreviewSource: Sendable {
 
         while true {
             let offset = reader.offset
-            guard let record = try reader.next(mode: mode, columns: nil) else { break }
-            if rows % Self.pageRows == 0 { offsets.append(offset) }
+            guard let record = try reader.next(mode: mode, columns: syntax == nil ? nil : 0..<1) else { break }
+            if rows % Self.pageRows == 0 {
+                pages.append(PreviewPageStart(offset: offset, syntaxState: state))
+            }
+            if syntax != nil, let cell = record.cells.first {
+                pageText += cell.display
+                if record.lineEnded { pageText += "\n" }
+            }
             rows += 1
             columns = max(columns, record.columns)
             textUnits = max(textUnits, record.textUnits)
             if rows % Self.pageRows == 0 {
                 try Task.checkCancellation()
+                if let syntax {
+                    _ = syntax.scan(pageText, continuing: &state, highlights: false)
+                    pageText.removeAll(keepingCapacity: true)
+                }
                 let now = DispatchTime.now().uptimeNanoseconds
                 if now >= nextUpdate {
-                    publish(PreviewIndexBatch(offsets: offsets, rows: rows, columns: columns,
+                    publish(PreviewIndexBatch(pages: pages, rows: rows, columns: columns,
                                               textUnits: textUnits, finished: false))
-                    offsets.removeAll(keepingCapacity: true)
+                    pages.removeAll(keepingCapacity: true)
                     nextUpdate = now + 120_000_000
                 }
             }
         }
-        publish(PreviewIndexBatch(offsets: offsets, rows: rows, columns: columns, textUnits: textUnits, finished: true))
+        publish(PreviewIndexBatch(pages: pages, rows: rows, columns: columns, textUnits: textUnits, finished: true))
     }
 
-    func readPage(at offset: UInt64, block: Int) throws -> [[PreviewCell]] {
-        let reader = PreviewRecordReader(file: file, encoding: encoding, offset: offset)
+    func readPage(at start: PreviewPageStart, block: Int) throws -> [[PreviewCell]] {
+        let reader = PreviewRecordReader(file: file, encoding: encoding, offset: start.offset)
         let startColumn = block * Self.blockColumns
         let columns = startColumn..<(startColumn + Self.blockColumns)
         var rows: [[PreviewCell]] = []
         rows.reserveCapacity(Self.pageRows)
+        let syntax = mode.language.map(CodeSyntax.forLanguage)
+        var ranges: [NSRange] = []
+        var pageText = ""
+        var textLength = 0
         for _ in 0..<Self.pageRows {
             try Task.checkCancellation()
             guard let record = try reader.next(mode: mode, columns: columns) else { break }
+            if syntax != nil, let cell = record.cells.first {
+                let length = cell.display.utf16.count
+                ranges.append(NSRange(location: textLength, length: length))
+                pageText += cell.display
+                if record.lineEnded { pageText += "\n" }
+                textLength += length + (record.lineEnded ? 1 : 0)
+            }
             rows.append(record.cells)
+        }
+        if let syntax, ranges.count == rows.count {
+            var state = start.syntaxState
+            let spans = syntax.scan(pageText, continuing: &state).sorted { $0.range.location < $1.range.location }
+            var first = 0
+            for (index, range) in ranges.enumerated() {
+                while first < spans.count, NSMaxRange(spans[first].range) <= range.location { first += 1 }
+                var spanIndex = first
+                while spanIndex < spans.count, spans[spanIndex].range.location < NSMaxRange(range) {
+                    let span = spans[spanIndex]
+                    let overlap = NSIntersectionRange(range, span.range)
+                    if overlap.length > 0 {
+                        rows[index][0].highlights.append(SyntaxSpan(
+                            range: NSRange(location: overlap.location - range.location, length: overlap.length),
+                            role: span.role))
+                    }
+                    spanIndex += 1
+                }
+            }
         }
         return rows
     }
@@ -213,6 +284,7 @@ private final class PreviewRecordReader {
         let cells: [PreviewCell]
         let columns: Int
         let textUnits: Int
+        var lineEnded = false
     }
 
     private enum FieldState { case start, plain, quoted, afterQuote }
@@ -308,10 +380,12 @@ private final class PreviewRecordReader {
         var field = Data()
         var units = 0
         var tabExpansion = 0
+        var lineEnded = false
         while let unit = try peek() {
             if unit == 10 || unit == 13 {
                 consume()
                 try swallowLF(after: unit)
+                lineEnded = true
                 break
             }
             // Fold enormous single lines into scrollable screen rows without splitting encoded scalars.
@@ -332,7 +406,7 @@ private final class PreviewRecordReader {
         }
         guard offset > start else { return nil }
         let cells = capture ? [PreviewCell(encoding.decode(field), singleLine: false)] : []
-        return Record(cells: cells, columns: 1, textUnits: units + tabExpansion)
+        return Record(cells: cells, columns: 1, textUnits: units + tabExpansion, lineEnded: lineEnded)
     }
 
     private func continuationCount(for unit: UInt16) -> Int {

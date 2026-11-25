@@ -205,6 +205,7 @@ struct ZipBrowserView: View {
             switch result {
             case .success(let contents):
                 self.contents = contents
+                browser.didOpenArchive(archive)
                 if contents.skipped > 0 { message = "跳过 \(contents.skipped) 个不支持的条目" }
             case .failure(let error): readError = error.localizedDescription
             }

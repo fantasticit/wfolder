@@ -9,15 +9,17 @@ struct PreparedPDF: @unchecked Sendable {
 }
 
 enum PreviewData: Sendable {
-    case text(String, monospaced: Bool)
+    case text(String, monospaced: Bool, highlights: [SyntaxSpan])
     case paged(PagedPreviewSource)
     case image(CGImage)
     case pdf(PreparedPDF)
-    case media
+    case media(MediaKind)
+    case applicationIcon
     case quickLook
 
     nonisolated static func load(_ entry: FileEntry) -> Self {
         guard !Task.isCancelled else { return .quickLook }
+        if entry.isApplication { return .applicationIcon }
         let url = entry.url
         let file = url.resolvingSymlinksInPath()
         guard (try? file.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true else {
@@ -26,13 +28,15 @@ enum PreviewData: Sendable {
         guard !Task.isCancelled else { return .quickLook }
         let ext = url.pathExtension.lowercased()
         let type = entry.contentType
+        if let language = entry.sourceLanguage {
+            return loadText(url, ext: ext, mode: .text(monospaced: true, language: language))
+        }
 
         if ext == "pdf" || type?.conforms(to: .pdf) == true {
             guard let document = PDFDocument(url: url) else { return .quickLook }
             return .pdf(PreparedPDF(document: document))
         }
-        if type?.conforms(to: .audiovisualContent) == true
-            || ["mp4", "mov", "m4v", "mp3", "m4a", "wav", "aiff", "aac", "flac"].contains(ext) { return .media }
+        if let mediaKind = entry.mediaKind { return .media(mediaKind) }
         if [
             "doc", "docx", "xls", "xlsx", "ppt", "pptx", "pages", "numbers", "key", "rtf", "rtfd",
             "svg", "gif"
@@ -47,27 +51,31 @@ enum PreviewData: Sendable {
                kCGImageSourceShouldCacheImmediately: true
            ] as CFDictionary) { return .image(thumbnail) }
 
-        let sourceFormats = [
-            "csv", "tsv", "txt", "md", "markdown", "json", "jsonl", "yaml", "yml", "xml", "html", "htm",
-            "log", "toml", "ini", "swift", "py", "js", "ts", "css", "sh", "sql", "conf", "rs", "go", "java"
-        ]
+        let sourceFormats = ["csv", "tsv", "txt", "md", "markdown", "log", "conf"]
         guard sourceFormats.contains(ext) || type?.conforms(to: .text) == true else { return .quickLook }
-        let monospaced = ext != "txt"
         let mode: PreviewPageMode = ext == "csv" || ext == "tsv"
             ? .delimited(separator: ext == "csv" ? 44 : 9)
-            : .text(monospaced: monospaced)
+            : .text(monospaced: ext != "txt")
+        return loadText(url, ext: ext, mode: mode)
+    }
+
+    private nonisolated static func loadText(_ url: URL, ext: String, mode: PreviewPageMode) -> Self {
         do {
             guard let source = try PagedPreviewSource(url: url, mode: mode) else { return .quickLook }
-            guard let text = try source.smallText() else { return .paged(source) }
+            guard var text = try source.smallText() else { return .paged(source) }
             if ext == "json",
                let json = try? JSONSerialization.jsonObject(with: Data(text.utf8), options: [.fragmentsAllowed]),
                let formatted = try? JSONSerialization.data(withJSONObject: json,
                    options: [.fragmentsAllowed, .sortedKeys, .prettyPrinted, .withoutEscapingSlashes]),
                formatted.count <= 512 * 1024,
                let readable = String(data: formatted, encoding: .utf8), hasShortLines(readable) {
-                return .text(readable, monospaced: true)
+                text = readable
             }
-            return hasShortLines(text) ? .text(text, monospaced: monospaced) : .paged(source)
+            guard hasShortLines(text), !Task.isCancelled,
+                  case .text(let monospaced, let language) = mode else { return .paged(source) }
+            var state: SyntaxDelimiter?
+            let highlights = language.map { CodeSyntax.forLanguage($0).scan(text, continuing: &state) } ?? []
+            return .text(text, monospaced: monospaced, highlights: highlights)
         } catch {
             return .quickLook
         }

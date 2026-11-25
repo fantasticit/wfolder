@@ -311,12 +311,7 @@ struct BrowserNavigation: View {
             validation = nil
             if let address {
                 endEditing()
-                switch address {
-                case .folder(let url): browser.navigate(to: url)
-                case .file(let url):
-                    browser.revealItem(at: url)
-                    browser.showPreview = true
-                }
+                browser.followAddress(address)
                 focusFileList()
             } else {
                 invalidPath = true

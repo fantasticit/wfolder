@@ -16,6 +16,7 @@ final class BrowserSession {
     var isTransferring = false
     var localMutationCount = 0
     let history: FileHistory
+    let frequentFiles: FrequentFiles
     @ObservationIgnored var enqueuePaste: ((PasteRequest, URL) -> Bool)?
     @ObservationIgnored var mutationFinished: (() -> Void)?
     var viewSettings = FileViewSettings.restore() {
@@ -35,6 +36,7 @@ final class BrowserSession {
         self.clipboard = clipboard ?? .general
         storage = WorkspaceStorage(defaults: defaults)
         history = FileHistory(defaults: defaults)
+        frequentFiles = FrequentFiles(defaults: defaults)
         stash = storage.stash
     }
 
@@ -190,6 +192,7 @@ final class BrowserWorkspace {
     var showsOperations = false
     var operationsTab: FileOperationsTab = .transfers
     var history: FileHistory { session.history }
+    var frequentFiles: FrequentFiles { session.frequentFiles }
 
     init(directory: URL, clipboard: NSPasteboard? = nil, restoreSession: Bool = false,
          defaults: UserDefaults = .standard) {
@@ -311,6 +314,21 @@ final class BrowserWorkspace {
         activeBrowser.revealItem(at: url)
     }
 
+    func followAddress(_ address: BrowserAddress) {
+        if let browser = directoryBrowser {
+            activatePane(browser)
+            browser.followAddress(address)
+        } else {
+            switch address {
+            case .folder(let url): navigateToFolder(url)
+            case .file(let url):
+                revealInFolder(url)
+                activeBrowser.showPreview = true
+            }
+        }
+        paneFocusRequest += 1
+    }
+
     private func insertPane(_ pane: BrowserModel, beside current: BrowserModel, direction: PaneSplitDirection) {
         tabs[activeIndex].layout = activeTab.layout.inserting(pane, beside: current.id, direction: direction)
         tabs[activeIndex].focusedPaneID = pane.id
@@ -369,6 +387,8 @@ final class BrowserWorkspace {
         transfers.startNext { [weak self] job in
             guard let self else { return }
             let relocations = self.session.updateStash(for: job.moved, keepingReferences: false)
+            self.frequentFiles.relocate(job.backups, trashing: true)
+            self.frequentFiles.relocate(relocations)
             let moving = job.request.operation == .move
             self.history.record(moving ? .move : .copy, count: moving ? relocations.count : job.completed.count,
                                 detail: job.request.directory.path, relocations: relocations + job.backups)
@@ -399,6 +419,7 @@ final class BrowserWorkspace {
         Task {
             let result = await Task.detached(priority: .userInitiated) { entry.undo() }.value
             history.didUndo(entry, result: result)
+            frequentFiles.relocate(result.restored, restoring: true)
             let stashed = result.restored.filter(\.wasInStash)
             session.updateStash(adding: stashed.map(\.original), removing: stashed.map(\.current))
             refreshLocations(result.restored.flatMap { [$0.original, $0.current] })

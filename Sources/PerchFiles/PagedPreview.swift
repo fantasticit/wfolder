@@ -76,7 +76,7 @@ private struct PagedGrid: NSViewRepresentable {
         table.dataSource = coordinator
         table.delegate = coordinator
         table.controller = coordinator
-        table.setAccessibilityLabel(source.mode.isTable ? "表格预览" : "文本预览")
+        table.setAccessibilityLabel(source.mode.isTable ? "表格预览" : source.mode.language == nil ? "文本预览" : "代码预览")
 
         let scroll = OverlayScrollView(frame: NSRect(x: 0, y: 0, width: 240, height: 220))
         scroll.documentView = table
@@ -116,7 +116,7 @@ private struct PagedGrid: NSViewRepresentable {
         private let status: Binding<PreviewStatus>
         private weak var table: PreviewTableView?
         private weak var scroll: NSScrollView?
-        private var offsets: [UInt64] = []
+        private var pages: [PreviewPageStart] = []
         private var rows = 0
         private var columns = 0
         private var textUnits = 0
@@ -195,7 +195,11 @@ private struct PagedGrid: NSViewRepresentable {
 
         func tableView(_ tableView: NSTableView, objectValueFor column: NSTableColumn?, row: Int) -> Any? {
             guard let column, let index = Int(column.identifier.rawValue) else { return nil }
-            return index < 0 ? String(row + 1) : value(at: row, column: index)?.display
+            if index < 0 { return String(row + 1) }
+            guard let cell = value(at: row, column: index) else { return nil }
+            if cell.highlights.isEmpty { return cell.display }
+            return SyntaxColors.attributed(cell.display, spans: cell.highlights,
+                                           font: .monospacedSystemFont(ofSize: 12, weight: .regular))
         }
 
         func tableView(_ tableView: NSTableView, toolTipFor cell: NSCell, rect: NSRectPointer,
@@ -224,7 +228,7 @@ private struct PagedGrid: NSViewRepresentable {
         private func apply(_ batch: PreviewIndexBatch) {
             guard let table, let scroll else { return }
             let first = rows == 0
-            offsets.append(contentsOf: batch.offsets)
+            pages.append(contentsOf: batch.pages)
             let rowsChanged = rows != batch.rows
             rows = batch.rows
             columns = batch.columns
@@ -290,7 +294,7 @@ private struct PagedGrid: NSViewRepresentable {
             if firstPage > 0 {
                 wanted.append(Tile(page: firstPage - 1, block: firstBlock))
             }
-            if lastPage + 1 < offsets.count {
+            if lastPage + 1 < pages.count {
                 wanted.append(Tile(page: lastPage + 1, block: firstBlock))
             }
             if (lastBlock + 1) * PagedPreviewSource.blockColumns < displayedColumns {
@@ -309,14 +313,14 @@ private struct PagedGrid: NSViewRepresentable {
 
         private func requestTiles() {
             for key in wanted where loading.count < 2 {
-                guard offsets.indices.contains(key.page), cache[key] == nil, loading[key] == nil,
+                guard pages.indices.contains(key.page), cache[key] == nil, loading[key] == nil,
                       !failedTiles.contains(key) else { continue }
                 let source = self.source
-                let offset = offsets[key.page]
+                let start = pages[key.page]
                 let task = Task.detached(priority: .userInitiated) {
-                    let rows = try source.readPage(at: offset, block: key.block)
+                    let rows = try source.readPage(at: start, block: key.block)
                     let bytes = rows.reduce(0) { length, row in
-                        length + row.reduce(0) { $0 + $1.value.utf8.count + $1.display.utf8.count + 64 }
+                        length + row.reduce(0) { $0 + $1.value.utf8.count + $1.display.utf8.count + $1.highlights.count * 24 + 64 }
                     }
                     return CachedPage(rows: rows, bytes: bytes)
                 }
@@ -374,7 +378,7 @@ private struct PagedGrid: NSViewRepresentable {
             let cell = NSTextFieldCell(textCell: "")
             if index < 0 {
                 cell.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-            } else if case .text(monospaced: true) = source.mode {
+            } else if case .text(monospaced: true, language: _) = source.mode {
                 cell.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
             } else {
                 cell.font = .systemFont(ofSize: 12)
