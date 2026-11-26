@@ -4,6 +4,7 @@ struct FolderTreeRow: View {
     let place: Place
     let model: BrowserModel
     let showHidden: Bool
+    var usesAccent = true
     let navigate: (URL) -> Void
 
     @ViewState private var expanded = false
@@ -41,16 +42,8 @@ struct FolderTreeRow: View {
             Button {
                 navigate(place.url)
             } label: {
-                Label {
-                    Text(place.name)
-                } icon: {
-                    Image(systemName: place.symbol)
-                        .symbolRenderingMode(.monochrome)
-                        .foregroundStyle(place.id == model.directory.path ? .primary : .secondary)
-                }
+                SidebarItemLabel(title: place.name, symbol: place.symbol, usesAccent: usesAccent)
                     .fontWeight(place.id == model.directory.path ? .semibold : .regular)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
             }
             .buttonStyle(.plain)
             .help(place.url.path)
@@ -74,6 +67,24 @@ struct FolderTreeRow: View {
             case .failure(let failure):
                 error = failure.localizedDescription
             }
+        }
+    }
+}
+
+struct SidebarItemLabel: View {
+    let title: String
+    let symbol: String
+    var usesAccent = true
+
+    var body: some View {
+        Label {
+            Text(title)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        } icon: {
+            Image(systemName: symbol)
+                .symbolRenderingMode(.monochrome)
+                .foregroundStyle(usesAccent ? Color(nsColor: .systemBlue) : Color.secondary)
         }
     }
 }

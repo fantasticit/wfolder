@@ -17,9 +17,18 @@ enum BrowserAddress: Sendable {
             let path = (input as NSString).expandingTildeInPath
             url = URL(fileURLWithPath: path, isDirectory: false, relativeTo: directory)
         }
-        let target = url.standardizedFileURL
+        return resolve(fileURL: url)
+    }
+
+    static func resolve(fileURL: URL, packagesAsFiles: Bool = false) -> Self? {
+        guard fileURL.isFileURL, !fileURL.path.utf8.contains(0) else { return nil }
+        let target = fileURL.standardizedFileURL
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: target.path, isDirectory: &isDirectory) else { return nil }
+        if isDirectory.boolValue, packagesAsFiles,
+           (try? target.resolvingSymlinksInPath().resourceValues(forKeys: [.isPackageKey]).isPackage) == true {
+            return .file(target)
+        }
         let resolved = URL(fileURLWithPath: target.path, isDirectory: isDirectory.boolValue)
         return isDirectory.boolValue ? .folder(resolved) : .file(resolved)
     }
@@ -61,10 +70,11 @@ struct BrowserTabs: View {
 
     private func tabButton(_ tab: BrowserWorkspace.Tab) -> some View {
         let active = workspace.activeTab.id == tab.id
+        let title = tab.title ?? (tab.showsQuickAccess ? "快速访问" : tab.focusedBrowser.directoryName)
         return HStack(spacing: 2) {
             Button { workspace.selectTab(tab.id) } label: {
-                Label(tab.title ?? tab.focusedBrowser.directoryName,
-                      systemImage: tab.browsers.count > 1 ? "rectangle.split.2x1" : "folder")
+                Label(title, systemImage: tab.showsQuickAccess ? "house" :
+                        (tab.browsers.count > 1 ? "rectangle.split.2x1" : "folder"))
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .font(.callout.weight(active ? .semibold : .regular))
@@ -77,11 +87,11 @@ struct BrowserTabs: View {
             }
             .buttonStyle(.plain)
             .accessibilityAddTraits(active ? .isSelected : [])
-            .help(tab.focusedBrowser.isStash ? tab.focusedBrowser.directoryName : tab.focusedBrowser.directory.path)
+            .help(tab.showsQuickAccess || tab.focusedBrowser.isStash ? title : tab.focusedBrowser.directory.path)
 
             if workspace.tabs.count > 1 {
                 Button { workspace.closeTab(tab.id) } label: {
-                    Label("关闭标签页 \(tab.title ?? tab.focusedBrowser.directoryName)", systemImage: "xmark")
+                    Label("关闭标签页 \(title)", systemImage: "xmark")
                         .labelStyle(.iconOnly)
                         .font(.system(size: 9, weight: .semibold))
                         .frame(width: 21, height: 24)
@@ -113,6 +123,7 @@ struct BrowserNavigation: View {
     @ViewState private var draft = ""
     @ViewState private var focusRequest = 0
     @ViewState private var invalidPath = false
+    @ViewState private var suggestions: [PathCompletion] = []
     @ViewState private var validation: Task<Void, Never>?
 
     var body: some View {
@@ -123,6 +134,15 @@ struct BrowserNavigation: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
+            if editing, !suggestions.isEmpty {
+                PathCompletionRows(suggestions: suggestions) { match in
+                    let address = match.directory ? BrowserAddress.folder(match.url) : .file(match.url)
+                    endEditing()
+                    model.followAddress(address)
+                    focusFileList()
+                }
+                .padding(.horizontal, 39)
+            }
             if invalidPath {
                 Label("找不到此文件或文件夹，请检查路径。", systemImage: "exclamationmark.circle")
                     .font(.caption)
@@ -137,6 +157,12 @@ struct BrowserNavigation: View {
         .onChange(of: workspace.addressFocusRequest) { if isActive { beginEditing() } }
         .onChange(of: isActive) { if !isActive { endEditing() } }
         .onChange(of: model.directory) { endEditing() }
+        .task(id: editing ? draft : "") {
+            suggestions = []
+            guard editing, draft != model.directory.path else { return }
+            let values = await PathCompletion.load(draft, root: model.directory)
+            if !Task.isCancelled { suggestions = values }
+        }
         .onDisappear { validation?.cancel() }
     }
 
@@ -179,7 +205,7 @@ struct BrowserNavigation: View {
                     validation?.cancel()
                     validation = nil
                     invalidPath = false
-                }), focusRequest: focusRequest, submit: submitAddress, blur: endEditing, cancel: {
+                }), focusRequest: focusRequest, submit: submitAddress, complete: completeAddress, blur: endEditing, cancel: {
                     endEditing()
                     focusFileList()
                 })
@@ -298,6 +324,15 @@ struct BrowserNavigation: View {
         editing = false
     }
 
+    private func completeAddress() -> Bool {
+        guard let first = suggestions.first, first.path != draft else { return false }
+        draft = first.path
+        validation?.cancel()
+        validation = nil
+        invalidPath = false
+        return true
+    }
+
     private func submitAddress() {
         validation?.cancel()
         let input = draft
@@ -325,6 +360,7 @@ private struct AddressField: NSViewRepresentable {
     @Binding var text: String
     let focusRequest: Int
     let submit: () -> Void
+    let complete: () -> Bool
     let blur: () -> Void
     let cancel: () -> Void
 
@@ -419,6 +455,8 @@ private struct AddressField: NSViewRepresentable {
             case #selector(NSResponder.insertNewline(_:)):
                 parent.submit()
                 return true
+            case #selector(NSResponder.insertTab(_:)):
+                return parent.complete()
             case #selector(NSResponder.cancelOperation(_:)):
                 parent.cancel()
                 return true

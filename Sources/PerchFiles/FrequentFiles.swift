@@ -24,6 +24,7 @@ final class FrequentFiles {
     private let storageKey = "wfolder.frequentFiles.v1"
     private var visits: [String: Visit]
     private(set) var items: [Item] = []
+    private(set) var recentItems: [Item] = []
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
 
     init(defaults: UserDefaults) {
@@ -36,11 +37,18 @@ final class FrequentFiles {
     deinit { refreshTask?.cancel() }
 
     func recordOpen(_ url: URL, at now: Date = .now) {
-        guard url.isFileURL else { return }
-        let key = FileSystem.locationKey(url)
-        let visit = visits[key]
-        visits[key] = Visit(url: url, score: (visit?.weight(at: now) ?? 0) + 1,
-                            lastOpened: max(now, visit?.lastOpened ?? now))
+        recordOpen([url], at: now)
+    }
+
+    func recordOpen(_ urls: [URL], at now: Date = .now) {
+        let files = urls.filter(\.isFileURL)
+        guard !files.isEmpty else { return }
+        for url in files {
+            let key = FileSystem.locationKey(url)
+            let visit = visits[key]
+            visits[key] = Visit(url: url, score: (visit?.weight(at: now) ?? 0) + 1,
+                                lastOpened: max(now, visit?.lastOpened ?? now))
+        }
         saveAndRefresh(at: now)
     }
 
@@ -86,19 +94,32 @@ final class FrequentFiles {
         let ranked = rankedVisits(at: now).filter { !$0.value.inTrash }
         if ranked.isEmpty {
             items = []
+            recentItems = []
             return
         }
         let worker = Task.detached(priority: .utility) {
-            var available: [Item] = []
-            for (key, visit) in ranked {
-                guard !Task.isCancelled else { break }
-                guard FileManager.default.fileExists(atPath: visit.url.path) else { continue }
-                let file = FileEntry.read(visit.url)
-                guard !file.isFolder else { continue }
-                available.append(Item(id: key, file: file))
-                if available.count == 6 { break }
+            var loaded: [String: Item] = [:]
+            func read(_ ranked: [(key: String, value: Visit)], limit: Int) -> [Item] {
+                var available: [Item] = []
+                for (key, visit) in ranked {
+                    guard !Task.isCancelled else { break }
+                    if let item = loaded[key] { available.append(item) }
+                    else if FileManager.default.fileExists(atPath: visit.url.path) {
+                        let file = FileEntry.read(visit.url)
+                        guard !file.isFolder else { continue }
+                        let item = Item(id: key, file: file)
+                        loaded[key] = item
+                        available.append(item)
+                    }
+                    if available.count == limit { break }
+                }
+                return available
             }
-            return available
+            let recent = ranked.sorted {
+                if $0.value.lastOpened != $1.value.lastOpened { return $0.value.lastOpened > $1.value.lastOpened }
+                return $0.key < $1.key
+            }
+            return (read(ranked, limit: 6), read(recent, limit: 15))
         }
         refreshTask = Task { [weak self] in
             let available = await withTaskCancellationHandler {
@@ -107,7 +128,8 @@ final class FrequentFiles {
                 worker.cancel()
             }
             guard !Task.isCancelled else { return }
-            if self?.items != available { self?.items = available }
+            if self?.items != available.0 { self?.items = available.0 }
+            if self?.recentItems != available.1 { self?.recentItems = available.1 }
         }
     }
 

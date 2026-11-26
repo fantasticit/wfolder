@@ -14,12 +14,21 @@ struct TextPreview: NSViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeNSView(context: Context) -> NSScrollView {
+        let view = NSTextView(usingTextLayoutManager: true)
+        view.textContainerInset = NSSize(width: 10, height: 10)
+        view.drawsBackground = false
+        view.isRichText = false
+        view.importsGraphics = false
+        view.setAccessibilityLabel("文本预览")
+        return Self.makeScrollView(for: view)
+    }
+
+    static func makeScrollView(for view: NSTextView) -> NSScrollView {
         let scroll = OverlayScrollView(frame: .zero)
         scroll.borderType = .noBorder
         scroll.drawsBackground = false
         scroll.hasVerticalScroller = true
 
-        let view = NSTextView(usingTextLayoutManager: true)
         view.frame = NSRect(origin: .zero, size: scroll.contentSize)
         view.autoresizingMask = [.width]
         view.minSize = .zero
@@ -29,16 +38,11 @@ struct TextPreview: NSViewRepresentable {
         view.textContainer?.widthTracksTextView = true
         view.textContainer?.heightTracksTextView = false
         view.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
-        view.textContainerInset = NSSize(width: 10, height: 10)
-        view.drawsBackground = false
         view.isEditable = false
         view.isSelectable = true
-        view.isRichText = false
-        view.importsGraphics = false
         view.isAutomaticLinkDetectionEnabled = false
         view.isAutomaticSpellingCorrectionEnabled = false
         view.isContinuousSpellCheckingEnabled = false
-        view.setAccessibilityLabel("文本预览")
         scroll.setAccessibilityLabel("预览内容")
         scroll.documentView = view
         return scroll

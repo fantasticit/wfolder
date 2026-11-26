@@ -21,20 +21,29 @@ struct FileViewSettings: Codable, Equatable {
     var showExtensions = true
     var hiddenColumns: Set<FileColumn> = []
     var columnWidths: [FileColumn: Double] = [:]
+    var columnOrder: [FileColumn]?
+    var showsSelectionCheckboxes: Bool?
+
+    var orderedColumns: [FileColumn] {
+        var seen = Set<FileColumn>()
+        return ((columnOrder ?? []) + FileColumn.allCases).filter { seen.insert($0).inserted }
+    }
 
     static let defaultsKey = "wfolder.fileViewSettings"
 
-    static func restore() -> Self {
-        guard let data = UserDefaults.standard.data(forKey: defaultsKey),
+    static func restore(defaults: UserDefaults = .standard) -> Self {
+        guard let data = defaults.data(forKey: defaultsKey),
               let settings = try? JSONDecoder().decode(Self.self, from: data) else { return Self() }
         return settings
     }
+}
 
-    func store() {
-        if let data = try? JSONEncoder().encode(self) {
-            UserDefaults.standard.set(data, forKey: Self.defaultsKey)
-        }
-    }
+struct FolderViewPreference: Codable, Equatable {
+    let mode: FileViewMode
+    let grouping: FileGrouping
+    let sort: FileColumn
+    let ascending: Bool
+    let settings: FileViewSettings
 }
 
 struct GroupedFileRows: Sendable {

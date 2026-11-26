@@ -49,6 +49,8 @@ final class FileDropScrollView: OverlayScrollView {
     var showHint: (FileDropHint?) -> Void = { _ in }
     var receive: ([URL], URL, PaneTransferOperation, Bool) -> Bool = { _, _, _, _ in false }
     var storeInStash: (([URL]) -> Void)?
+    var receiveArchive: ((ArchiveDrag, URL) -> Bool)?
+    private var archiveDrag: ArchiveDrag?
 
     private var sources: [URL] = []
     private var volumes: [NSObject] = []
@@ -61,6 +63,8 @@ final class FileDropScrollView: OverlayScrollView {
     private var hint: FileDropHint?
 
     override func draggingEntered(_ info: any NSDraggingInfo) -> NSDragOperation {
+        archiveDrag = info.draggingPasteboard.data(forType: ArchiveDrag.pasteboardType)
+            .flatMap { try? JSONDecoder().decode(ArchiveDrag.self, from: $0) }
         let urls = info.draggingPasteboard.readObjects(forClasses: [NSURL.self],
             options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
         sources = urls.filter(\.isFileURL)
@@ -73,7 +77,7 @@ final class FileDropScrollView: OverlayScrollView {
     }
 
     override func draggingUpdated(_ info: any NSDraggingInfo) -> NSDragOperation {
-        if !sources.isEmpty, storeInStash != nil || canReceive() { scrollNearEdge(info.draggingLocation) }
+        if !sources.isEmpty || archiveDrag != nil, storeInStash != nil || canReceive() { scrollNearEdge(info.draggingLocation) }
         return updateDrop(info)
     }
 
@@ -92,14 +96,21 @@ final class FileDropScrollView: OverlayScrollView {
             storeInStash(sources)
             return true
         case .transfer(let directory, let operation):
+            if let archiveDrag { return receiveArchive?(archiveDrag, directory) == true }
             return receive(sources, directory, operation, fromStash)
         }
     }
 
     private func updateDrop(_ info: any NSDraggingInfo) -> NSDragOperation {
-        guard !sources.isEmpty, contentView.frame.contains(convert(info.draggingLocation, from: nil)) else {
+        guard archiveDrag != nil || !sources.isEmpty, contentView.frame.contains(convert(info.draggingLocation, from: nil)) else {
             updateHint(nil)
             return []
+        }
+        if archiveDrag != nil {
+            guard receiveArchive != nil, canReceive(), info.draggingSourceOperationMask.contains(.copy),
+                  let directory = destination(info.draggingLocation) else { updateHint(nil); return [] }
+            updateHint(.transfer(directory, .copy))
+            return .copy
         }
         if storeInStash != nil {
             let accepts = !fromStash && info.draggingSourceOperationMask.contains(.copy)
@@ -155,6 +166,7 @@ final class FileDropScrollView: OverlayScrollView {
 
     private func clearDrop() {
         updateHint(nil)
+        archiveDrag = nil
         sources.removeAll()
         volumes.removeAll()
         lastDirectory = nil

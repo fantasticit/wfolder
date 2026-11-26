@@ -8,6 +8,7 @@ struct GoToPathSheet: View {
     @FocusState private var pathFocused: Bool
     @ViewState private var path = ""
     @ViewState private var invalidPath = false
+    @ViewState private var suggestions: [PathCompletion] = []
     @ViewState private var validation: Task<Void, Never>?
 
     var body: some View {
@@ -20,9 +21,18 @@ struct GoToPathSheet: View {
                     .textFieldStyle(.roundedBorder)
                     .focused($pathFocused)
                     .onSubmit(submit)
+                    .onKeyPress(.tab) {
+                        guard let match = suggestions.first, match.path != path else { return .ignored }
+                        path = match.path
+                        return .handled
+                    }
                 if validation != nil {
                     ProgressView().controlSize(.small).accessibilityLabel("正在查找路径")
                 }
+            }
+            PathCompletionRows(suggestions: suggestions) { match in
+                path = match.path
+                pathFocused = true
             }
             if invalidPath {
                 Label("找不到此文件或文件夹，请检查路径。", systemImage: "exclamationmark.circle")
@@ -44,6 +54,11 @@ struct GoToPathSheet: View {
             validation?.cancel()
             validation = nil
             invalidPath = false
+        }
+        .task(id: path) {
+            suggestions = []
+            let values = await PathCompletion.load(path, root: baseDirectory)
+            if !Task.isCancelled { suggestions = values }
         }
         .onDisappear { validation?.cancel() }
     }

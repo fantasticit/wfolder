@@ -4,6 +4,10 @@ struct BrowserView: View {
     private static let clipboardPoll = Timer.publish(every: 0.75, on: .main, in: .common).autoconnect()
 
     @ViewState private var workspace: BrowserWorkspace
+    @ViewState private var aiConversation = AIConversation()
+    @ViewState private var mountedVolumes: [MountedLocation] = []
+    @ViewState private var volumeRefreshID = UUID()
+    @ViewState private var actionAfterToolDismissal: (() -> Void)?
     private let restoresSession: Bool
     private let onWorkspaceReady: (BrowserWorkspace) -> Void
 
@@ -23,16 +27,27 @@ struct BrowserView: View {
                 .navigationSplitViewColumnWidth(min: 164, ideal: 192, max: 270)
         } detail: {
             files
-                .navigationTitle(model.directoryName)
+                .navigationTitle(workspace.activeTab.showsQuickAccess ? "快速访问" : model.directoryName)
                 .toolbar { toolbar }
                 .searchable(text: $model.query, isPresented: $model.presentsSearch,
                             placement: .toolbar, prompt: "搜索文件和文件夹")
-                .inspector(isPresented: $model.showPreview) {
-                    PreviewPane(model: model, openFolder: { workspace.navigateToFolder($0.url) })
-                        .inspectorColumnWidth(min: 240, ideal: 310, max: 520)
+                .inspector(isPresented: inspectorVisibility) {
+                    inspectorContent
+                        .inspectorColumnWidth(min: workspace.showsAIAssistantSidebar ? 300 : 240,
+                                              ideal: workspace.showsAIAssistantSidebar ? 360 : 310,
+                                              max: workspace.showsAIAssistantSidebar ? 560 : 520)
                 }
         }
         .focusedSceneValue(\.browserWorkspace, workspace)
+        .task { await refreshVolumes() }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didMountNotification)) { _ in
+            workspace.refreshMountedPanes()
+            Task { await refreshVolumes() }
+        }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didUnmountNotification)) { _ in
+            workspace.refreshMountedPanes()
+            Task { await refreshVolumes() }
+        }
         .onAppear {
             onWorkspaceReady(workspace)
             workspace.frequentFiles.refresh()
@@ -52,7 +67,11 @@ struct BrowserView: View {
             workspace.refreshClipboard()
         }
         .onReceive(NotificationCenter.default.publisher(for: .focusFileSearch)) { _ in
+            workspace.showFolderBrowser()
             model.presentsSearch = true
+        }
+        .onChange(of: model.presentsSearch) { _, visible in
+            if visible { workspace.showFolderBrowser() }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             workspace.refreshClipboard()
@@ -71,13 +90,32 @@ struct BrowserView: View {
         .sheet(item: Binding(get: { workspace.transferChoice }, set: { workspace.transferChoice = $0 })) { choice in
             TransferTargetPicker(choice: choice, workspace: workspace)
         }
-        .sheet(item: Binding(get: { workspace.presentedTool }, set: { workspace.presentedTool = $0 })) { tool in
+        .sheet(item: Binding(get: { workspace.destinationRequest }, set: { workspace.destinationRequest = $0 })) { request in
+            TransferDestinationView(request: request, workspace: workspace)
+        }
+        .sheet(item: Binding(get: { workspace.presentedTool }, set: { workspace.presentedTool = $0 }),
+               onDismiss: {
+                   let action = actionAfterToolDismissal
+                   actionAfterToolDismissal = nil
+                   action?()
+               }) { tool in
             switch tool {
             case .workspaces: WorkspaceLibrary(workspace: workspace)
             case .batchRename(let browser, let entries):
                 BatchRenameView(browser: browser, entries: entries) { workspace.presentedTool = nil }
             case .compare: FolderCompareView(workspace: workspace)
             case .spotlight: SpotlightSearchView(workspace: workspace)
+            case .advancedSearch(let folder): AdvancedSearchView(workspace: workspace, existing: folder)
+            case .commands: CommandPalette(workspace: workspace)
+            case .remote: RemoteLocationsView(workspace: workspace)
+            case .organization: OrganizationView(workspace: workspace)
+            case .organizationDraft(let rule): OrganizationView(workspace: workspace, draft: rule)
+            case .aiAssistant:
+                AIAssistantView(
+                    workspace: workspace, conversation: aiConversation, isInSidebar: false,
+                    changePlacement: { dismissTool(then: workspace.pinAIAssistant) },
+                    close: { workspace.presentedTool = nil }, performAction: dismissTool(then:)
+                )
             case .goToPath:
                 GoToPathSheet(baseDirectory: workspace.directoryBrowser?.directory ?? model.directory) {
                     workspace.followAddress($0)
@@ -94,16 +132,69 @@ struct BrowserView: View {
         }
     }
 
+    private var inspectorVisibility: Binding<Bool> {
+        Binding(
+            get: { workspace.showsAIAssistantSidebar || (model.showPreview && !workspace.activeTab.showsQuickAccess) },
+            set: { visible in
+                if !visible {
+                    model.showPreview = false
+                    workspace.hideAIAssistantSidebar()
+                } else if !workspace.showsAIAssistantSidebar {
+                    model.showPreview = true
+                }
+            }
+        )
+    }
+
+    @ViewBuilder private var inspectorContent: some View {
+        if workspace.showsAIAssistantSidebar {
+            VSplitView {
+                if model.showPreview && !workspace.activeTab.showsQuickAccess {
+                    previewPane.frame(minHeight: 132, idealHeight: 190, maxHeight: .infinity)
+                }
+                AIAssistantView(
+                    workspace: workspace, conversation: aiConversation, isInSidebar: true,
+                    changePlacement: workspace.openAIAssistantAsSheet, close: workspace.hideAIAssistantSidebar,
+                    performAction: { $0() }
+                )
+                .frame(minHeight: 270, idealHeight: 420, maxHeight: .infinity)
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("AI 助手侧边栏")
+            }
+        } else {
+            previewPane
+        }
+    }
+
+    private var previewPane: some View {
+        PreviewPane(model: model, openFolder: { workspace.navigateToFolder($0.url) })
+    }
+
+    private func dismissTool(then action: @escaping () -> Void) {
+        actionAfterToolDismissal = action
+        workspace.presentedTool = nil
+    }
+
+    private func refreshVolumes() async {
+        let request = UUID()
+        volumeRefreshID = request
+        let volumes = await Task.detached { MountedLocation.list() }.value
+        if !Task.isCancelled, volumeRefreshID == request { mountedVolumes = volumes }
+    }
+
     private var sidebar: some View {
         let directoryModel = workspace.directoryBrowser ?? model
+        let disk = Place(name: "本机磁盘", symbol: "internaldrive", url: URL(fileURLWithPath: "/", isDirectory: true))
+        let knownPlaces = BrowserModel.defaults + [disk]
         let favorites = model.favorites.map { url in
-            Place(name: BrowserModel.placeName(for: url), symbol: "folder", url: url)
+            knownPlaces.first { $0.url == url }
+                ?? Place(name: BrowserModel.placeName(for: url), symbol: "folder", url: url)
         }
         let shortcuts = BrowserModel.defaults.filter { !model.isFavorite($0.url) }
-        let disk = Place(name: "本机磁盘", symbol: "internaldrive", url: URL(fileURLWithPath: "/", isDirectory: true))
+        let frequentItems = workspace.frequentFiles.items
         let showHidden = workspace.showHidden
         let selection = Binding<String?>(
-            get: { model.isStash ? nil : model.directory.path },
+            get: { model.isVirtual || workspace.activeTab.showsQuickAccess ? nil : model.directory.path },
             set: { value in
                 if let value { workspace.navigateToFolder(URL(fileURLWithPath: value, isDirectory: true)) }
             }
@@ -111,20 +202,35 @@ struct BrowserView: View {
 
         return List(selection: selection) {
             Section {
-                ForEach(shortcuts) { FolderTreeRow(place: $0, model: directoryModel, showHidden: showHidden, navigate: workspace.navigateToFolder) }
+                Button { workspace.openQuickAccess() } label: {
+                    SidebarItemLabel(title: "快速访问", symbol: "house")
+                        .fontWeight(workspace.activeTab.showsQuickAccess ? .semibold : .regular)
+                }
+                .buttonStyle(.plain)
+                .selectionDisabled()
+            }
+            Section {
+                ForEach(shortcuts) { place in
+                    FolderTreeRow(place: place, model: directoryModel, showHidden: showHidden,
+                                  usesAccent: place.url != BrowserModel.home, navigate: workspace.navigateToFolder)
+                }
             } header: {
                 Text("常用位置").background(OverlayScrollIndicators())
             }
-            if !workspace.frequentFiles.items.isEmpty {
+            if !frequentItems.isEmpty {
                 Section("经常访问") {
-                    ForEach(workspace.frequentFiles.items) { item in
+                    // Keep sidebar row positions stable when a click changes the ranking.
+                    ForEach(frequentItems.indices, id: \.self) { index in
+                        let item = frequentItems[index]
                         let file = item.file
-                        Button { workspace.activeBrowser.openEntry(file) } label: {
-                            sidebarLabel(file.name, symbol: file.glyph.symbol)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
+                        HStack {
+                            Button { workspace.activeBrowser.openEntry(file) } label: {
+                                SidebarItemLabel(title: file.name, symbol: file.glyph.symbol)
+                            }
+                            .buttonStyle(.plain)
+                            .id(item.id)
                         }
-                        .buttonStyle(.plain)
+                        .selectionDisabled()
                         .help(file.url.path)
                         .contextMenu {
                             Button("前往所在文件夹") { workspace.revealInFolder(file.url) }
@@ -136,18 +242,81 @@ struct BrowserView: View {
             if !favorites.isEmpty {
                 Section("收藏") {
                     ForEach(favorites) { place in
-                        FolderTreeRow(place: place, model: directoryModel, showHidden: showHidden, navigate: workspace.navigateToFolder)
+                        FolderTreeRow(place: place, model: directoryModel, showHidden: showHidden,
+                                      usesAccent: place.url != BrowserModel.home && place.url != disk.url,
+                                      navigate: workspace.navigateToFolder)
                             .contextMenu { Button("取消收藏") { model.toggleFavorite(place.url) } }
                     }
                 }
             }
+            if !mountedVolumes.isEmpty {
+                Section("磁盘与共享") {
+                    ForEach(mountedVolumes) { volume in
+                        Button { workspace.openLocationPane(volume.url, mounted: true) } label: {
+                            SidebarItemLabel(title: volume.name, symbol: volume.isNetwork ? "network" : "externaldrive",
+                                             usesAccent: false)
+                        }
+                        .buttonStyle(.plain)
+                        .help(volume.url.path)
+                        .contextMenu {
+                            Button("打开", systemImage: "folder") { workspace.openLocationPane(volume.url, mounted: true) }
+                            Button("复制路径", systemImage: "link") { model.copyPath(volume.url) }
+                            if volume.canUnmount {
+                                Divider()
+                                Button(volume.unmountTitle, systemImage: "eject") {
+                                    Task {
+                                        await workspace.unmountLocation(volume)
+                                        await refreshVolumes()
+                                    }
+                                }
+                                .disabled(workspace.unmountingVolumes.contains(volume.id))
+                            }
+                        }
+                    }
+                }
+            }
+            if !workspace.remoteLocations.isEmpty {
+                Section("服务器") {
+                    ForEach(workspace.remoteLocations) { location in
+                        Button {
+                            Task {
+                                do { try await workspace.connectRemote(location) }
+                                catch is CancellationError { return }
+                                catch { model.issue = BrowserIssue(title: "服务器连接失败", message: error.localizedDescription) }
+                            }
+                        } label: {
+                            SidebarItemLabel(title: location.name, symbol: "network", usesAccent: false)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(workspace.connectingRemote != nil)
+                        .contextMenu { Button("移除位置") { workspace.removeRemote(location) } }
+                    }
+                }
+            }
+            if !workspace.smartFolders.isEmpty {
+                Section("智能文件夹") {
+                    ForEach(workspace.smartFolders) { folder in
+                        Button { workspace.openSmartFolder(folder) } label: {
+                            SidebarItemLabel(title: folder.name, symbol: "folder.badge.gearshape")
+                        }
+                        .buttonStyle(.plain)
+                        .contextMenu {
+                            Button("编辑…") { workspace.presentedTool = .advancedSearch(folder) }
+                            Button("移除") { workspace.removeSmartFolder(folder) }
+                        }
+                    }
+                }
+            }
             if !model.isFavorite(disk.url) {
-                Section("位置") { FolderTreeRow(place: disk, model: directoryModel, showHidden: showHidden, navigate: workspace.navigateToFolder) }
+                Section("位置") {
+                    FolderTreeRow(place: disk, model: directoryModel, showHidden: showHidden,
+                                  usesAccent: false, navigate: workspace.navigateToFolder)
+                }
             }
             Section {
                 Button { workspace.openStashPane() } label: {
                     HStack {
-                        sidebarLabel("文件暂存架", symbol: "tray")
+                        SidebarItemLabel(title: "文件暂存架", symbol: "tray")
                         Spacer()
                         if !workspace.stash.isEmpty {
                             Text("\(workspace.stash.count)").font(.caption).foregroundStyle(.secondary)
@@ -160,26 +329,21 @@ struct BrowserView: View {
             }
         }
         .listStyle(.sidebar)
+        .tint(.gray)
+        .transaction(value: frequentItems.map(\.id)) {
+            $0.animation = nil
+            $0.disablesAnimations = true
+        }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             HStack {
                 Button(action: chooseFolder) {
-                    sidebarLabel("选取文件夹…", symbol: "folder.badge.plus")
+                    SidebarItemLabel(title: "选取文件夹…", symbol: "folder.badge.plus")
                 }
                 .buttonStyle(.borderless)
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, 15)
             .padding(.vertical, 12)
-        }
-    }
-
-    private func sidebarLabel(_ title: String, symbol: String) -> some View {
-        Label {
-            Text(title)
-        } icon: {
-            Image(systemName: symbol)
-                .symbolRenderingMode(.monochrome)
-                .foregroundStyle(.secondary)
         }
     }
 
@@ -233,6 +397,8 @@ struct BrowserView: View {
         }
 
         ToolbarItemGroup(placement: .automatic) {
+            Button("AI 助手", systemImage: "sparkles", action: workspace.openAIAssistant)
+                .help("AI 助手（⌥⌘A）")
             FileViewMenu(model: model, workspace: workspace)
             Button {
                 if workspace.showsOperations { workspace.showsOperations = false }
@@ -261,6 +427,10 @@ struct BrowserView: View {
                 Button("文件暂存架", systemImage: "tray", action: workspace.openStashPane)
                 Button("对比面板目录…", systemImage: "arrow.left.arrow.right") { workspace.presentedTool = .compare }
                     .disabled(workspace.folderBrowsers.count < 2)
+                Button("高级搜索…", systemImage: "line.3.horizontal.decrease") { workspace.presentedTool = .advancedSearch(nil) }
+                Button("命令面板…", systemImage: "command") { workspace.presentedTool = .commands }
+                Button("服务器与磁盘…", systemImage: "network") { workspace.presentedTool = .remote }
+                Button("整理规则…", systemImage: "tray.and.arrow.down") { workspace.presentedTool = .organization }
                 Button("Spotlight 搜索…", systemImage: "magnifyingglass") { workspace.presentedTool = .spotlight }
             } label: {
                 Label("工作区工具", systemImage: "briefcase")
@@ -280,7 +450,11 @@ struct BrowserView: View {
         return VStack(spacing: 0) {
             BrowserTabs(workspace: workspace).background(.bar)
             Divider()
-            PaneWorkspaceView(tab: tab, workspace: workspace).id(tab.id)
+            if tab.showsQuickAccess {
+                QuickAccessView(workspace: workspace).id(tab.id)
+            } else {
+                PaneWorkspaceView(tab: tab, workspace: workspace).id(tab.id)
+            }
         }
     }
 
@@ -478,39 +652,51 @@ private struct BrowserPane: View {
         return GeometryReader { proxy in
             ZStack {
                 if let archive = model.zipArchive {
-                    ZipBrowserView(archive: archive, browser: model).id(archive.id)
+                    ZipBrowserView(archive: archive, browser: model) {
+                        if model.isArchivePane { workspace.closeArchivePane(model) }
+                        else { model.closeZip() }
+                    }.id(archive.id)
                         .simultaneousGesture(TapGesture().onEnded { workspace.activatePane(model) })
                 } else if model.viewMode == .details {
                     FileTable(actions: actions, listing: listing, selection: model.selectedIDs,
                               settings: model.viewSettings, groupedRows: model.groupedRows, viewportWidth: proxy.size.width,
-                              showsLocation: model.isStash || model.hasSearch, sortColumn: model.sortColumn, ascending: model.ascending,
+                              showsLocation: model.isVirtual || model.hasSearch, sortColumn: model.sortColumn, ascending: model.ascending,
                               focusRequest: fileListFocusRequest, showDropHint: indicateDrop)
                 } else {
                     FileGrid(actions: actions, listing: listing, selection: model.selectedIDs, mode: model.viewMode,
-                             showsLocation: model.isStash || model.hasSearch, showExtensions: model.viewSettings.showExtensions,
+                             showsLocation: model.isVirtual || model.hasSearch, showExtensions: model.viewSettings.showExtensions,
+                             showsCheckboxes: model.viewSettings.showsSelectionCheckboxes == true,
                              focusRequest: fileListFocusRequest, showDropHint: indicateDrop)
                 }
                 if model.zipArchive != nil {
                     EmptyView()
                 } else if model.loading, entries.isEmpty {
-                    ProgressView(model.isStash ? "正在读取暂存项目…" : "正在读取文件夹…").controlSize(.small)
-                } else if let error = model.loadError {
+                    ProgressView(model.smartFolder != nil ? "正在搜索文件…"
+                                 : model.isStash ? "正在读取暂存项目…" : "正在读取文件夹…")
+                        .controlSize(.small)
+                } else if let error = model.loadError, model.searchScope != .workspace || !model.hasSearch {
                     ContentUnavailableView {
-                        Label("无法读取此文件夹", systemImage: "exclamationmark.folder")
+                        Label(model.smartFolder != nil ? "搜索未完成" : "无法读取此文件夹",
+                              systemImage: "exclamationmark.folder")
                     } description: {
                         Text(error)
                     } actions: {
                         Button("重试") { model.refresh() }
                     }
                 } else if model.searchingDescendants && entries.isEmpty {
-                    ProgressView("正在搜索子目录…").controlSize(.small).allowsHitTesting(false)
+                    ProgressView("正在搜索…").controlSize(.small).allowsHitTesting(false)
+                } else if model.smartSearchStopped && entries.isEmpty {
+                    ContentUnavailableView("搜索已停止", systemImage: "magnifyingglass")
                 } else if entries.isEmpty {
-                    if model.query.isEmpty {
+                    if model.quickSearchFilters.isActive {
+                        ContentUnavailableView("没有符合筛选条件的文件", systemImage: "magnifyingglass")
+                            .allowsHitTesting(false)
+                    } else if model.query.isEmpty {
                         if model.isStash {
                             ContentUnavailableView("拖入文件或文件夹", systemImage: "tray.and.arrow.down")
                                 .allowsHitTesting(false)
                         } else {
-                            ContentUnavailableView("空文件夹", systemImage: "folder").allowsHitTesting(false)
+                            ContentUnavailableView(model.smartFolder == nil ? "空文件夹" : "没有匹配的文件", systemImage: "folder").allowsHitTesting(false)
                         }
                     } else {
                         ContentUnavailableView.search(text: model.query).allowsHitTesting(false)
@@ -520,15 +706,17 @@ private struct BrowserPane: View {
         }
         .safeAreaInset(edge: .top, spacing: 0) {
             VStack(spacing: 0) {
-                if showsHeader || model.isStash { paneHeader }
-                if model.zipArchive != nil || !model.isStash {
+                if showsHeader || model.isVirtual { paneHeader }
+                if !model.isVirtual {
                     BrowserNavigation(workspace: workspace, model: model, isActive: isActive,
                                       focusFileList: focusFileList)
                 }
-                if !model.isStash, model.zipArchive == nil, model.presentsSearch || model.hasSearch { searchControls(model) }
+                if !model.isVirtual, model.zipArchive == nil, model.presentsSearch || model.hasSearch { searchControls(model) }
             }
         }
-        .safeAreaInset(edge: .bottom, spacing: 0) { status }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if model.zipArchive == nil { status }
+        }
         .overlay {
             if dropHint != nil {
                 Rectangle().strokeBorder(Color.accentColor, lineWidth: 2).allowsHitTesting(false)
@@ -540,8 +728,12 @@ private struct BrowserPane: View {
         }
         .onChange(of: model.viewMode) { if isActive && !model.presentsSearch { focusFileList() } }
         .onChange(of: workspace.paneFocusRequest) { if isActive { focusFileList() } }
-        .onChange(of: model.directory) { dropHint = nil }
+        .onChange(of: model.directory) {
+            dropHint = nil
+            workspace.followLinkedNavigation(from: model)
+        }
         .onChange(of: model.isStash ? workspace.stash : []) { model.refreshIfStarted() }
+        .onChange(of: workspace.searchDirectories(for: model.id)) { model.refreshWorkspaceSearch() }
     }
 
     private var paneHeader: some View {
@@ -551,7 +743,7 @@ private struct BrowserPane: View {
         } label: {
             HStack(spacing: 6) {
                 Image(systemName: model.isStash ? "tray" : "rectangle")
-                Text(model.isStash ? "文件暂存架" : "面板 \(number)")
+                Text(model.isVirtual ? model.directoryName : "面板 \(number)")
                 Spacer(minLength: 0)
             }
             .font(.caption.weight(isActive ? .semibold : .regular))
@@ -573,34 +765,71 @@ private struct BrowserPane: View {
     }
 
     private func searchControls(_ model: BrowserModel) -> some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 10) {
-                Picker("搜索范围", selection: Binding(get: { model.searchScope }, set: { scope in
-                    workspace.activatePane(model)
-                    model.searchScope = scope
-                })) {
-                    ForEach(FolderSearchScope.allCases) { scope in
-                        Text(scope.rawValue).tag(scope)
+        let roots = model.searchDirectories.map(\.path)
+        return VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 6) {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 8) { scopePicker(model); searchFilters(model) }
+                    VStack(alignment: .leading, spacing: 6) { scopePicker(model); searchFilters(model) }
+                }
+                HStack(spacing: 6) {
+                    Image(systemName: "folder")
+                    Text(roots.first.map { roots.count == 1 ? $0 : "\($0) 等 \(roots.count) 个目录" } ?? "")
+                        .lineLimit(1).truncationMode(.middle)
+                        .help(roots.joined(separator: "\n"))
+                        .accessibilityLabel("搜索目录 " + roots.joined(separator: "，"))
+                    Spacer(minLength: 0)
+                    if model.searchingDescendants {
+                        ProgressView().controlSize(.mini)
+                        Button("停止", action: model.stopFolderSearch)
+                    } else if let notice = model.searchNotice {
+                        Text(notice).lineLimit(1).help(notice)
                     }
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .fixedSize()
-                Spacer(minLength: 0)
-                if model.searchingDescendants {
-                    ProgressView().controlSize(.mini)
-                    Text("正在搜索…")
-                } else if let notice = model.searchNotice {
-                    Label(notice, systemImage: "exclamationmark.circle").lineLimit(1).help(notice)
-                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
-            .font(.caption)
-            .foregroundStyle(.secondary)
+            .controlSize(.small)
             .padding(.horizontal, 12)
-            .frame(height: 34)
+            .padding(.vertical, 7)
             Divider()
         }
         .background(.bar)
+    }
+
+    private func scopePicker(_ model: BrowserModel) -> some View {
+        Picker("搜索范围", selection: Binding(get: { model.searchScope }, set: { scope in
+            workspace.activatePane(model)
+            model.searchScope = scope
+        })) {
+            ForEach(FolderSearchScope.allCases) { scope in Text(scope.rawValue).tag(scope) }
+        }
+        .pickerStyle(.menu)
+        .labelsHidden()
+        .fixedSize()
+        .accessibilityLabel("搜索范围")
+    }
+
+    private func searchFilters(_ model: BrowserModel) -> some View {
+        @Bindable var model = model
+        return HStack(spacing: 6) {
+            Picker("文件类型", selection: $model.quickSearchFilters.kind) {
+                ForEach(SearchFileKind.allCases) { kind in Text(kind.rawValue).tag(kind) }
+            }
+            .accessibilityLabel("文件类型")
+            Picker("修改日期", selection: $model.quickSearchFilters.date) {
+                ForEach(QuickSearchDate.allCases) { date in Text(date.rawValue).tag(date) }
+            }
+            .accessibilityLabel("修改日期")
+            if model.quickSearchFilters.isActive {
+                Button("清除筛选", systemImage: "xmark.circle") { model.quickSearchFilters = .init() }
+                    .labelStyle(.iconOnly)
+                    .help("清除筛选")
+            }
+        }
+        .pickerStyle(.menu)
+        .labelsHidden()
+        .fixedSize()
     }
 
     private var status: some View {
@@ -608,7 +837,19 @@ private struct BrowserPane: View {
             Divider()
             HStack(spacing: 7) {
                 Spacer(minLength: 12)
-                if let dropHint {
+                if let scanned = model.smartSearchScanned {
+                    if scanned == 0 {
+                        Text("正在搜索…")
+                    } else {
+                        Text("已扫描 \(scanned) 项")
+                    }
+                    Button("停止搜索") { model.stopSmartSearch() }
+                } else if model.smartSearchStopped {
+                    Text("搜索已停止")
+                    Button("重新搜索") { model.refresh() }
+                } else if model.smartFolder != nil, let notice = model.searchNotice {
+                    Label(notice, systemImage: "exclamationmark.circle").lineLimit(1).help(notice)
+                } else if let dropHint {
                     Text(dropHint.title)
                         .lineLimit(1)
                         .help(dropHint.directory?.path ?? dropHint.title)
@@ -625,12 +866,10 @@ private struct BrowserPane: View {
                 } else if workspace.isTransferring || model.busy {
                     ProgressView().controlSize(.mini)
                     Text("正在处理…")
-                } else if let selected = model.selected {
-                    Text(selected.isFolder ? "已选 1 项" : "已选 1 项 · \(selected.sizeLabel)")
                 } else if !model.selectedIDs.isEmpty {
-                    Text("已选 \(model.selectedIDs.count) 项")
+                    Text(model.selectionSummary)
                 } else {
-                    Text(model.query.isEmpty ? "\(model.entries.count) 项" : "\(model.visibleEntries.count) 项匹配")
+                    Text(model.hasSearch ? "\(model.visibleEntries.count) 项匹配" : "\(model.entries.count) 项")
                 }
             }
             .font(.caption)
@@ -675,6 +914,8 @@ private struct FileViewMenu: View {
                     }
                     Button("还原列宽") { model.viewSettings.columnWidths.removeAll() }
                         .disabled(model.viewSettings.columnWidths.isEmpty)
+                    Button("还原列顺序") { model.viewSettings.columnOrder = nil }
+                        .disabled(model.viewSettings.columnOrder == nil)
                 }
             } else {
                 Section("排序") {
@@ -690,6 +931,14 @@ private struct FileViewMenu: View {
             Section("显示") {
                 Toggle("显示文件扩展名", isOn: $model.viewSettings.showExtensions)
                 Toggle("显示隐藏文件", isOn: Binding(get: { workspace.showHidden }, set: workspace.setShowHidden))
+            }
+            Section("选择") {
+                Toggle("显示项目复选框", isOn: Binding(
+                    get: { model.viewSettings.showsSelectionCheckboxes == true },
+                    set: { model.viewSettings.showsSelectionCheckboxes = $0 }
+                ))
+                Button("全选当前结果", action: model.selectAllResults).disabled(model.visibleEntries.isEmpty)
+                Button("反向选择", action: model.invertSelection).disabled(model.visibleEntries.isEmpty)
             }
         } label: {
             Label("视图", systemImage: model.viewMode == .details ? "list.bullet" : "square.grid.2x2")

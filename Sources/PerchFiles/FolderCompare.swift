@@ -5,6 +5,22 @@ enum FolderCopyDirection: String, CaseIterable, Identifiable, Sendable {
     var id: Self { self }
 }
 
+struct DirectoryPair: Codable, Equatable, Sendable {
+    let left: URL
+    let right: URL
+    let linked: Bool
+
+    func target(for directory: URL, from source: URL, to destination: URL) -> URL? {
+        let path = directory.standardizedFileURL.path
+        let root = source.standardizedFileURL.path
+        if path == root { return destination }
+        let prefix = root == "/" ? "/" : root + "/"
+        guard path.hasPrefix(prefix) else { return nil }
+        let suffix = String(path.dropFirst(prefix.count))
+        return destination.appendingPathComponent(suffix, isDirectory: true)
+    }
+}
+
 struct FolderComparison: Sendable {
     struct Item: Equatable, Sendable {
         enum Kind: Equatable, Sendable { case folder, file, link, other }
@@ -43,6 +59,13 @@ struct FolderComparison: Sendable {
 
         func sides(_ direction: FolderCopyDirection) -> (source: Item?, target: Item?) {
             direction == .leftToRight ? (left, right) : (right, left)
+        }
+
+        func planLabel(_ direction: FolderCopyDirection, includeNewer: Bool) -> String {
+            let (source, target) = sides(direction)
+            guard source != nil else { return "仅目标有 · 保留" }
+            if shouldSync(direction, includeNewer: includeNewer) { return target == nil ? "新增" : "更新" }
+            return "冲突 · 保留"
         }
 
         func shouldSync(_ direction: FolderCopyDirection, includeNewer: Bool) -> Bool {
@@ -230,6 +253,14 @@ struct FolderCompareView: View {
     @ViewState private var confirmSync = false
     @ViewState private var request = 0
     @ViewState private var message: String?
+    @ViewState private var linked = false
+    @ViewState private var leftPreview: FileEntry?
+    @ViewState private var rightPreview: FileEntry?
+
+    private var inspected: FolderComparison.Difference? {
+        guard selection.count == 1, let path = selection.first else { return nil }
+        return comparison?.differences.first { $0.id == path }
+    }
 
     private var panes: [BrowserModel] { workspace.folderBrowsers }
     private var syncPaths: Set<String> {
@@ -246,18 +277,32 @@ struct FolderCompareView: View {
                 choice("左侧", selection: $left)
                 choice("右侧", selection: $right)
                 Button("对比") { request += 1 }.disabled(left == nil || right == nil || left == right || comparing || applying)
+                Spacer()
+                Toggle("联动导航", isOn: $linked)
+                    .onChange(of: linked) { savePair() }
+                Button("保存目录对", action: savePair).disabled(left == nil || right == nil || left == right)
             }
             if comparing {
                 ProgressView("正在比较文件内容…").frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let comparison, !comparison.differences.isEmpty {
-                List(comparison.differences, selection: $selection) { row in
-                    HStack {
-                        Text(row.path).lineLimit(1).truncationMode(.middle)
-                        Spacer()
-                        Text(row.status).font(.caption).foregroundStyle(.secondary)
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("同步计划").font(.subheadline.weight(.semibold))
+                        List(comparison.differences, selection: $selection) { row in
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(row.path).lineLimit(1).truncationMode(.middle)
+                                Text(row.planLabel(direction, includeNewer: includeNewer))
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                            .tag(row.id)
+                            .help(row.path + " · " + row.status)
+                        }
                     }
-                    .tag(row.id)
-                    .help(row.path)
+                    .frame(width: 250)
+                    Divider()
+                    counterpart("左侧", entry: leftPreview)
+                    Divider()
+                    counterpart("右侧", entry: rightPreview)
                 }
             } else {
                 ContentUnavailableView(comparison == nil ? "选择两个目录开始对比" : "目录内容一致",
@@ -281,15 +326,31 @@ struct FolderCompareView: View {
             }
         }
         .padding(18)
-        .frame(width: 720, height: 490)
+        .frame(minWidth: 855, idealWidth: 1040, minHeight: 490, idealHeight: 600)
         .interactiveDismissDisabled(applying)
         .onAppear {
-            left = workspace.directoryBrowser?.id
-            right = panes.first { $0.id != left }?.id
+            let pair = workspace.activeTab.comparisonPair
+            left = workspace.activeTab.linkedPaneIDs.first ??
+                panes.first { $0.directory.path == pair?.left.path }?.id ?? workspace.directoryBrowser?.id
+            right = workspace.activeTab.linkedPaneIDs.dropFirst().first ??
+                panes.first { $0.id != left && $0.directory.path == pair?.right.path }?.id
+                ?? panes.first { $0.id != left }?.id
+            linked = pair?.linked == true
         }
         .onChange(of: left) { invalidate() }
         .onChange(of: right) { invalidate() }
         .task(id: request) { if request > 0 { await scan() } }
+        .task(id: inspected?.id) {
+            leftPreview = nil
+            rightPreview = nil
+            guard let row = inspected else { return }
+            let previews = await Task.detached {
+                let left = row.left?.kind == .file ? row.left.map { FileEntry.read($0.url) } : nil
+                let right = row.right?.kind == .file ? row.right.map { FileEntry.read($0.url) } : nil
+                return (left, right)
+            }.value
+            if !Task.isCancelled { (leftPreview, rightPreview) = previews }
+        }
         .alert("单向同步 \(syncPaths.count) 项？", isPresented: $confirmSync) {
             Button("取消", role: .cancel) {}
             Button("同步") { apply(syncPaths, sync: true) }
@@ -297,6 +358,26 @@ struct FolderCompareView: View {
             Text(includeNewer ? "补齐缺失的文件，并替换目标侧内容不同且修改时间较早的同名文件。"
                  : "将缺失的文件复制到目标侧。")
         }
+    }
+
+    private func counterpart(_ title: String, entry: FileEntry?) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(.subheadline.weight(.semibold))
+            if let entry {
+                FilePreview(entry: entry)
+            } else {
+                ContentUnavailableView(inspected == nil ? "选择一项差异" : "此处没有可预览文件",
+                                       systemImage: "doc.viewfinder")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private func savePair() {
+        guard let left = panes.first(where: { $0.id == left }),
+              let right = panes.first(where: { $0.id == right }), left !== right else { return }
+        workspace.saveComparisonPair(left: left, right: right, linked: linked)
     }
 
     private func choice(_ title: String, selection: Binding<UUID?>) -> some View {

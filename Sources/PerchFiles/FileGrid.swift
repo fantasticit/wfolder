@@ -11,6 +11,7 @@ struct FileGrid: NSViewRepresentable {
     let mode: FileViewMode
     let showsLocation: Bool
     let showExtensions: Bool
+    var showsCheckboxes = false
     let focusRequest: Int
     let showDropHint: (FileDropHint?) -> Void
     private var model: BrowserModel { actions.model }
@@ -70,17 +71,17 @@ struct FileGrid: NSViewRepresentable {
         let directoryChanged = coordinator.directory != model.directory
         let dataChanged = coordinator.listingID != listing.id
         let styleChanged = coordinator.mode != mode || coordinator.showsLocation != showsLocation
-            || coordinator.showExtensions != showExtensions
+            || coordinator.showExtensions != showExtensions || coordinator.showsCheckboxes != showsCheckboxes
         if dataChanged || styleChanged {
+            grid.endMarquee()
             coordinator.listingID = listing.id
             coordinator.entries = listing.entries
             coordinator.mode = mode
             coordinator.showsLocation = showsLocation
             coordinator.showExtensions = showExtensions
+            coordinator.showsCheckboxes = showsCheckboxes
             if dataChanged { grid.selectionAnchor = nil }
-            layout.itemSize = mode == .large
-                ? NSSize(width: 156, height: showsLocation ? 166 : 150)
-                : NSSize(width: 112, height: showsLocation ? 130 : 114)
+            layout.itemSize = FileGridItem.size(for: mode, showsLocation: showsLocation)
             grid.reloadData()
         }
         if directoryChanged {
@@ -104,6 +105,7 @@ struct FileGrid: NSViewRepresentable {
     }
 
     static func dismantleNSView(_ view: NSScrollView, coordinator: Coordinator) {
+        (view.documentView as? BrowserCollectionView)?.endMarquee()
         coordinator.stopObserving()
     }
 
@@ -122,6 +124,7 @@ struct FileGrid: NSViewRepresentable {
         var mode: FileViewMode = .details
         var showsLocation = false
         var showExtensions = true
+        var showsCheckboxes = false
         var focusRequest = 0
         var applying = false
 
@@ -186,6 +189,14 @@ struct FileGrid: NSViewRepresentable {
             let item = collectionView.makeItem(withIdentifier: FileGridItem.identifier, for: indexPath)
             if let item = item as? FileGridItem, let entry = entry(at: indexPath) {
                 item.configure(entry, mode: mode, showsLocation: showsLocation, showExtensions: showExtensions)
+                item.configureCheckbox(visible: showsCheckboxes, name: entry.filename) { [weak self, weak collectionView] in
+                    guard let self, let collectionView, self.entry(at: indexPath)?.id == entry.id else { return }
+                    self.actions.activate()
+                    var selection = collectionView.selectionIndexPaths
+                    selection.formSymmetricDifference([indexPath])
+                    collectionView.selectionIndexPaths = selection
+                    self.selectionChanged(in: collectionView)
+                }
             }
             return item
         }
@@ -225,7 +236,7 @@ struct FileGrid: NSViewRepresentable {
             let visible = grid.visibleItems().compactMap { item -> (String, FileGridItem, FileEntry)? in
                 guard let item = item as? FileGridItem, item.view.frame.intersects(viewport),
                       let entry = item.entry, !entry.isFolder, !entry.isApplication,
-                      entry.sourceLanguage == nil,
+                      entry.cloudStatus != .online, entry.sourceLanguage == nil,
                       entry.mediaKind == .video || entry.contentType?.conforms(to: .image) == true else { return nil }
                 let key = "\(entry.url.path)\u{0}\(entry.modified?.timeIntervalSinceReferenceDate ?? -1)\u{0}\(entry.size ?? -1)\u{0}\(edge)\u{0}\(scale)"
                 return (key, item, entry)
@@ -316,9 +327,17 @@ private final class GridThumbnail {
 }
 
 private final class BrowserCollectionView: NSCollectionView, FileDragSource {
+    private struct Marquee {
+        let origin: NSPoint
+        let originalSelection: Set<IndexPath>
+        let modifiers: NSEvent.ModifierFlags
+    }
+
     weak var controller: FileGrid.Coordinator?
     var dragsFromStash: Bool { controller?.actions.model.isStash == true }
     var selectionAnchor: Int?
+    private var marquee: Marquee?
+    private let marqueeView = GridMarqueeView(frame: .zero)
 
     override func becomeFirstResponder() -> Bool {
         let accepted = super.becomeFirstResponder()
@@ -328,10 +347,18 @@ private final class BrowserCollectionView: NSCollectionView, FileDragSource {
 
     override func mouseDown(with event: NSEvent) {
         controller?.actions.activate()
-        guard let controller, let path = indexPathForItem(at: convert(event.locationInWindow, from: nil)),
-              let entry = controller.entry(at: path) else {
-            if !event.modifierFlags.contains(.shift) { selectionAnchor = nil }
+        endMarquee()
+        guard let controller, !event.modifierFlags.contains(.control) else {
             super.mouseDown(with: event)
+            return
+        }
+        let point = convert(event.locationInWindow, from: nil)
+        layoutSubtreeIfNeeded()
+        guard let path = indexPathForItem(at: point), let item = item(at: path) as? FileGridItem,
+              item.intersectsContent(NSRect(x: point.x, y: point.y, width: 1, height: 1), in: self),
+              let entry = controller.entry(at: path) else {
+            window?.makeFirstResponder(self)
+            marquee = Marquee(origin: point, originalSelection: selectionIndexPaths, modifiers: event.modifierFlags)
             return
         }
         if event.clickCount == 2 {
@@ -350,6 +377,66 @@ private final class BrowserCollectionView: NSCollectionView, FileDragSource {
         }
         selectionAnchor = path.item
         super.mouseDown(with: event)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let marquee else {
+            super.mouseDragged(with: event)
+            return
+        }
+        let location = convert(event.locationInWindow, from: nil)
+        guard marqueeView.superview != nil || hypot(location.x - marquee.origin.x, location.y - marquee.origin.y) >= 4
+        else { return }
+        if autoscroll(with: event) { layoutSubtreeIfNeeded() }
+        updateMarquee(marquee, to: convert(event.locationInWindow, from: nil))
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard let marquee else {
+            super.mouseUp(with: event)
+            return
+        }
+        let additive = marquee.modifiers.contains(.shift) || marquee.modifiers.contains(.command)
+        if marqueeView.superview != nil {
+            updateMarquee(marquee, to: convert(event.locationInWindow, from: nil))
+        } else if !additive {
+            applyMarqueeSelection([])
+        }
+        if !additive || selectionAnchor == nil { selectionAnchor = selectionIndexPaths.min()?.item }
+        endMarquee()
+    }
+
+    func endMarquee() {
+        marquee = nil
+        marqueeView.removeFromSuperview()
+    }
+
+    private func updateMarquee(_ marquee: Marquee, to point: NSPoint) {
+        let rect = NSRect(x: min(marquee.origin.x, point.x), y: min(marquee.origin.y, point.y),
+                          width: max(1, abs(marquee.origin.x - point.x)),
+                          height: max(1, abs(marquee.origin.y - point.y)))
+        marqueeView.frame = rect
+        if marqueeView.superview == nil { addSubview(marqueeView, positioned: .above, relativeTo: nil) }
+        let attributes = collectionViewLayout?.layoutAttributesForElements(in: rect) ?? []
+        let paths = Set(attributes.compactMap { attribute -> IndexPath? in
+            guard attribute.representedElementCategory == .item, rect.intersects(attribute.frame),
+                  let path = attribute.indexPath else { return nil }
+            if let item = item(at: path) as? FileGridItem, !item.intersectsContent(rect, in: self) { return nil }
+            return path
+        })
+        if marquee.modifiers.contains(.shift) {
+            applyMarqueeSelection(marquee.originalSelection.union(paths))
+        } else if marquee.modifiers.contains(.command) {
+            applyMarqueeSelection(marquee.originalSelection.symmetricDifference(paths))
+        } else {
+            applyMarqueeSelection(paths)
+        }
+    }
+
+    private func applyMarqueeSelection(_ paths: Set<IndexPath>) {
+        guard selectionIndexPaths != paths else { return }
+        selectionIndexPaths = paths
+        controller?.selectionChanged(in: self)
     }
 
     override func menu(for event: NSEvent) -> NSMenu? {
@@ -382,6 +469,17 @@ private final class BrowserCollectionView: NSCollectionView, FileDragSource {
     }
 }
 
+private final class GridMarqueeView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.controlAccentColor.withAlphaComponent(0.16).setFill()
+        bounds.fill()
+        NSColor.controlAccentColor.setStroke()
+        NSBezierPath(rect: bounds.insetBy(dx: 0.5, dy: 0.5)).stroke()
+    }
+}
+
 private final class FileGridTile: NSView {
     var selected = false { didSet { needsDisplay = true } }
 
@@ -401,12 +499,19 @@ private final class FileGridTile: NSView {
 private final class FileGridPicture: NSImageView {
     var duration: String? { didSet { needsDisplay = true } }
 
-    override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-        guard let duration, let image, image.size.width > 0, image.size.height > 0 else { return }
-        let scale = min(1, bounds.width / image.size.width, bounds.height / image.size.height)
+    var imageBounds: NSRect {
+        guard let image, image.size.width > 0, image.size.height > 0 else { return .zero }
+        let fit = min(bounds.width / image.size.width, bounds.height / image.size.height)
+        let scale = imageScaling == .scaleProportionallyDown ? min(1, fit) : fit
         let width = image.size.width * scale
         let height = image.size.height * scale
+        return NSRect(x: bounds.midX - width / 2, y: bounds.midY - height / 2, width: width, height: height)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard let duration else { return }
+        let imageRect = imageBounds
         let text = NSAttributedString(string: duration, attributes: [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .semibold),
             .foregroundColor: NSColor.white
@@ -414,9 +519,9 @@ private final class FileGridPicture: NSImageView {
         let size = text.size()
         let badgeWidth = size.width + 8
         let badgeHeight = size.height + 2
-        guard width >= badgeWidth + 6, height >= badgeHeight + 6 else { return }
-        let badge = NSRect(x: bounds.midX + width / 2 - badgeWidth - 3,
-                           y: isFlipped ? bounds.midY + height / 2 - badgeHeight - 3 : bounds.midY - height / 2 + 3,
+        guard imageRect.width >= badgeWidth + 6, imageRect.height >= badgeHeight + 6 else { return }
+        let badge = NSRect(x: imageRect.maxX - badgeWidth - 3,
+                           y: isFlipped ? imageRect.maxY - badgeHeight - 3 : imageRect.minY + 3,
                            width: badgeWidth, height: badgeHeight)
         NSColor.black.withAlphaComponent(0.76).setFill()
         NSBezierPath(roundedRect: badge, xRadius: 3, yRadius: 3).fill()
@@ -426,10 +531,18 @@ private final class FileGridPicture: NSImageView {
 
 private final class FileGridItem: NSCollectionViewItem {
     static let identifier = NSUserInterfaceItemIdentifier("FileGridItem")
-    private let nameLabel = NSTextField(labelWithString: "")
+    private static let horizontalPadding: CGFloat = 7
+
+    static func size(for mode: FileViewMode, showsLocation: Bool) -> NSSize {
+        let large = mode == .large
+        return NSSize(width: large ? 156 : 120, height: (large ? 182 : 146) + (showsLocation ? 16 : 0))
+    }
+
+    private let nameLabel = NSTextField(wrappingLabelWithString: "")
     private let kindLabel = NSTextField(labelWithString: "")
     private let location = NSTextField(labelWithString: "")
     private let picture = FileGridPicture()
+    private let checkbox = FileSelectionCheckbox()
     private var pictureHeight: NSLayoutConstraint!
     private(set) var entry: FileEntry?
     private(set) var thumbnailKey: String?
@@ -442,11 +555,16 @@ private final class FileGridItem: NSCollectionViewItem {
         picture.imageScaling = .scaleProportionallyDown
         pictureHeight = picture.heightAnchor.constraint(equalToConstant: 62)
         nameLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        nameLabel.alignment = .center
+        nameLabel.maximumNumberOfLines = 3
+        nameLabel.lineBreakMode = .byWordWrapping
+        nameLabel.cell?.truncatesLastVisibleLine = true
+        nameLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         kindLabel.font = .systemFont(ofSize: 10)
         kindLabel.textColor = .secondaryLabelColor
         location.font = .systemFont(ofSize: 10)
         location.textColor = .secondaryLabelColor
-        for label in [nameLabel, kindLabel, location] {
+        for label in [kindLabel, location] {
             label.alignment = .center
             label.maximumNumberOfLines = 1
             label.lineBreakMode = .byTruncatingMiddle
@@ -458,9 +576,12 @@ private final class FileGridItem: NSCollectionViewItem {
         stack.spacing = 3
         stack.translatesAutoresizingMaskIntoConstraints = false
         tile.addSubview(stack)
+        tile.addSubview(checkbox)
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: tile.leadingAnchor, constant: 7),
-            stack.trailingAnchor.constraint(equalTo: tile.trailingAnchor, constant: -7),
+            checkbox.leadingAnchor.constraint(equalTo: tile.leadingAnchor, constant: 5),
+            checkbox.topAnchor.constraint(equalTo: tile.topAnchor, constant: 5),
+            stack.leadingAnchor.constraint(equalTo: tile.leadingAnchor, constant: Self.horizontalPadding),
+            stack.trailingAnchor.constraint(equalTo: tile.trailingAnchor, constant: -Self.horizontalPadding),
             stack.topAnchor.constraint(equalTo: tile.topAnchor, constant: 8),
             picture.widthAnchor.constraint(equalTo: stack.widthAnchor),
             pictureHeight,
@@ -474,9 +595,26 @@ private final class FileGridItem: NSCollectionViewItem {
         didSet { applySelection() }
     }
 
+    func intersectsContent(_ rect: NSRect, in container: NSView) -> Bool {
+        view.layoutSubtreeIfNeeded()
+        if rect.intersects(picture.convert(picture.imageBounds, to: container)) { return true }
+        return [nameLabel, kindLabel, location].contains { label in
+            guard !label.isHidden, !label.stringValue.isEmpty else { return false }
+            let width = min(label.bounds.width, ceil(label.attributedStringValue.size().width) + 4)
+            let text = NSRect(x: label.bounds.midX - width / 2, y: label.bounds.minY,
+                              width: width, height: label.bounds.height)
+            return rect.intersects(label.convert(text, to: container))
+        }
+    }
+
     private func applySelection() {
         (view as? FileGridTile)?.selected = isSelected
         nameLabel.font = .systemFont(ofSize: 12, weight: isSelected ? .semibold : .medium)
+        checkbox.state = isSelected ? .on : .off
+    }
+
+    func configureCheckbox(visible: Bool, name: String, onToggle: @escaping () -> Void) {
+        checkbox.configure(visible: visible, name: name, selected: isSelected, onToggle: onToggle)
     }
 
     func configure(_ entry: FileEntry, mode: FileViewMode, showsLocation: Bool, showExtensions: Bool) {
@@ -497,13 +635,34 @@ private final class FileGridItem: NSCollectionViewItem {
                 self.picture.image = image
             }
         }
+        nameLabel.preferredMaxLayoutWidth = Self.size(for: mode, showsLocation: showsLocation).width
+            - 2 * Self.horizontalPadding
         nameLabel.stringValue = entry.displayName(showExtensions: showExtensions)
-        kindLabel.stringValue = entry.kind
+        kindLabel.stringValue = entry.cloudStatus.map { entry.kind + " · " + $0.rawValue } ?? entry.kind
         let path = entry.url.deletingLastPathComponent().path
         location.isHidden = !showsLocation
         location.stringValue = showsLocation ? (path as NSString).abbreviatingWithTildeInPath : ""
-        view.toolTip = showsLocation ? entry.filename + "\n" + path : entry.filename
+        let fullName = entry.filename
+        let help = showsLocation ? fullName + "\n" + path : fullName
+        let wrappedName = Self.wrapTooltip(fullName)
+        let tooltip = showsLocation ? wrappedName + "\n" + Self.wrapTooltip(path) : wrappedName
+        for target in [view, picture, nameLabel, kindLabel, location] {
+            target.toolTip = tooltip
+        }
+        nameLabel.setAccessibilityHelp(help)
+        picture.setAccessibilityHelp(help)
         applySelection()
+    }
+
+    private static func wrapTooltip(_ text: String) -> String {
+        var lines: [Substring] = []
+        var start = text.startIndex
+        while start < text.endIndex {
+            let end = text.index(start, offsetBy: 48, limitedBy: text.endIndex) ?? text.endIndex
+            lines.append(text[start..<end])
+            start = end
+        }
+        return lines.joined(separator: "\n")
     }
 
     func showThumbnail(_ thumbnail: GridThumbnail, key: String) {

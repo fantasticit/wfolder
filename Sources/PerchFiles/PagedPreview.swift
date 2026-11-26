@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 struct PagedPreview: View {
-    let source: PagedPreviewSource
+    let source: any PreviewGridSource
     @ViewState private var status = PreviewStatus()
 
     var body: some View {
@@ -22,7 +22,7 @@ struct PagedPreview: View {
             Divider()
             HStack(spacing: 6) {
                 if status.rows > 0 {
-                    Text(source.mode.isTable
+                    Text(source.isTable
                          ? "\(status.rows.formatted()) 行 · \(status.columns.formatted()) 列"
                          : "\(status.rows.formatted()) 行")
                         .monospacedDigit()
@@ -53,7 +53,7 @@ private struct PreviewStatus: Equatable {
 }
 
 private struct PagedGrid: NSViewRepresentable {
-    let source: PagedPreviewSource
+    let source: any PreviewGridSource
     @Binding var status: PreviewStatus
 
     func makeCoordinator() -> Coordinator { Coordinator(source: source, status: $status) }
@@ -62,21 +62,21 @@ private struct PagedGrid: NSViewRepresentable {
         let coordinator = context.coordinator
         let table = PreviewTableView()
         table.style = .plain
-        table.headerView = source.mode.isTable ? NSTableHeaderView() : nil
-        table.rowHeight = source.mode.isTable ? 23 : 20
+        table.headerView = source.isTable ? NSTableHeaderView() : nil
+        table.rowHeight = source.isTable ? 23 : 20
         table.intercellSpacing = NSSize(width: 0, height: 1)
-        table.usesAlternatingRowBackgroundColors = source.mode.isTable
+        table.usesAlternatingRowBackgroundColors = source.isTable
         table.gridStyleMask = .solidVerticalGridLineMask
         table.gridColor = .separatorColor
         table.columnAutoresizingStyle = .noColumnAutoresizing
         table.allowsColumnReordering = false
-        table.allowsColumnResizing = source.mode.isTable
+        table.allowsColumnResizing = source.isTable
         table.allowsEmptySelection = true
         table.selectionHighlightStyle = .none
         table.dataSource = coordinator
         table.delegate = coordinator
         table.controller = coordinator
-        table.setAccessibilityLabel(source.mode.isTable ? "表格预览" : source.mode.language == nil ? "文本预览" : "代码预览")
+        table.setAccessibilityLabel(source.isTable ? "表格预览" : source.language == nil ? "文本预览" : "代码预览")
 
         let scroll = OverlayScrollView(frame: NSRect(x: 0, y: 0, width: 240, height: 220))
         scroll.documentView = table
@@ -86,7 +86,7 @@ private struct PagedGrid: NSViewRepresentable {
         scroll.automaticallyAdjustsContentInsets = false
         scroll.hasVerticalScroller = true
         scroll.hasHorizontalScroller = true
-        scroll.setAccessibilityLabel(source.mode.isTable ? "表格预览内容" : "预览内容")
+        scroll.setAccessibilityLabel(source.isTable ? "表格预览内容" : "预览内容")
         coordinator.start(in: scroll, table: table)
         return scroll
     }
@@ -112,7 +112,7 @@ private struct PagedGrid: NSViewRepresentable {
             let bytes: Int
         }
 
-        private let source: PagedPreviewSource
+        private let source: any PreviewGridSource
         private let status: Binding<PreviewStatus>
         private weak var table: PreviewTableView?
         private weak var scroll: NSScrollView?
@@ -132,7 +132,7 @@ private struct PagedGrid: NSViewRepresentable {
         private var cacheBytes = 0
         private var failedTiles = Set<Tile>()
 
-        init(source: PagedPreviewSource, status: Binding<PreviewStatus>) {
+        init(source: any PreviewGridSource, status: Binding<PreviewStatus>) {
             self.source = source
             self.status = status
         }
@@ -204,7 +204,7 @@ private struct PagedGrid: NSViewRepresentable {
 
         func tableView(_ tableView: NSTableView, toolTipFor cell: NSCell, rect: NSRectPointer,
                        tableColumn: NSTableColumn?, row: Int, mouseLocation: NSPoint) -> String {
-            guard source.mode.isTable, let tableColumn, let index = Int(tableColumn.identifier.rawValue),
+            guard source.isTable, let tableColumn, let index = Int(tableColumn.identifier.rawValue),
                   let cell = value(at: row, column: index) else { return "" }
             return String(cell.value.prefix(500))
         }
@@ -236,7 +236,7 @@ private struct PagedGrid: NSViewRepresentable {
 
             if displayedColumns == 0, columns > 0 {
                 addColumns(upTo: min(columns, 32))
-            } else if !source.mode.isTable, let column = table.tableColumns.last, displayedColumns == 1 {
+            } else if !source.isTable, let column = table.tableColumns.last, displayedColumns == 1 {
                 let width = max(scroll.contentSize.width - 58, source.textWidth(for: textUnits))
                 if column.width != width {
                     column.width = width
@@ -363,7 +363,7 @@ private struct PagedGrid: NSViewRepresentable {
         private func addColumns(upTo target: Int) {
             guard let table, let scroll, target > displayedColumns else { return }
             for index in displayedColumns..<target {
-                let width = source.mode.isTable ? 110 : max(scroll.contentSize.width - 58, source.textWidth(for: textUnits))
+                let width = source.isTable ? 110 : max(scroll.contentSize.width - 58, source.textWidth(for: textUnits))
                 let column = makeColumn(index: index, width: width)
                 table.addTableColumn(column)
                 totalColumnWidth += column.width
@@ -378,7 +378,7 @@ private struct PagedGrid: NSViewRepresentable {
             let cell = NSTextFieldCell(textCell: "")
             if index < 0 {
                 cell.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-            } else if case .text(monospaced: true, language: _) = source.mode {
+            } else if source.isMonospaced {
                 cell.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
             } else {
                 cell.font = .systemFont(ofSize: 12)
@@ -389,9 +389,9 @@ private struct PagedGrid: NSViewRepresentable {
             cell.usesSingleLineMode = true
             cell.lineBreakMode = .byTruncatingTail
             column.dataCell = cell
-            column.resizingMask = index >= 0 && source.mode.isTable ? .userResizingMask : []
+            column.resizingMask = index >= 0 && source.isTable ? .userResizingMask : []
             column.minWidth = index < 0 ? width : 52
-            column.maxWidth = index < 0 ? width : (source.mode.isTable ? 600 : 50_000)
+            column.maxWidth = index < 0 ? width : (source.isTable ? 600 : 50_000)
             column.width = width
             return column
         }

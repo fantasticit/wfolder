@@ -6,6 +6,46 @@
 	<string>zh_CN</string>
 	<key>CFBundleDisplayName</key>
 	<string>wfolder</string>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Folders</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.folder</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Previewable Files</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.adobe.pdf</string>
+				<string>net.daringfireball.markdown</string>
+				<string>public.plain-text</string>
+				<string>public.rtf</string>
+				<string>public.comma-separated-values-text</string>
+				<string>public.tab-separated-values-text</string>
+				<string>org.openxmlformats.spreadsheetml.sheet</string>
+				<string>org.openxmlformats.wordprocessingml.document</string>
+				<string>public.png</string>
+				<string>public.jpeg</string>
+				<string>com.apple.quicktime-movie</string>
+				<string>public.mpeg-4</string>
+				<string>public.zip-archive</string>
+				<string>public.opentype-font</string>
+			</array>
+		</dict>
+	</array>
 	<key>CFBundleExecutable</key>
 	<string>PerchFiles</string>
 	<key>CFBundleIconFile</key>
@@ -19,9 +59,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>2.12.0</string>
+	<string>2.18.0</string>
 	<key>CFBundleVersion</key>
-	<string>28</string>
+	<string>39</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>NSDesktopFolderUsageDescription</key>
@@ -32,5 +72,55 @@
 	<string>wfolder需要读取下载内容，以浏览和操作该文件夹中的文件。</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>UTImportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>net.daringfireball.markdown</string>
+			<key>UTTypeDescription</key>
+			<string>Markdown</string>
+			<key>UTTypeConformsTo</key>
+			<array><string>public.plain-text</string></array>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array><string>md</string><string>markdown</string></array>
+				<key>public.mime-type</key>
+				<string>text/markdown</string>
+			</dict>
+		</dict>
+	</array>
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>local.perchfiles.archive-members</string>
+			<key>UTTypeConformsTo</key>
+			<array><string>public.data</string></array>
+		</dict>
+	</array>
+	<key>NSServices</key>
+	<array>
+		<dict>
+			<key>NSMenuItem</key>
+			<dict>
+				<key>default</key>
+				<string>在 wfolder 中打开</string>
+			</dict>
+			<key>NSMessage</key>
+			<string>openInWfolder</string>
+			<key>NSPortName</key>
+			<string>wfolder</string>
+			<key>NSRequiredContext</key>
+			<dict>
+				<key>NSApplicationIdentifier</key>
+				<string>com.apple.finder</string>
+			</dict>
+			<key>NSSendFileTypes</key>
+			<array>
+				<string>public.item</string>
+			</array>
+		</dict>
+	</array>
 </dict>
 </plist>

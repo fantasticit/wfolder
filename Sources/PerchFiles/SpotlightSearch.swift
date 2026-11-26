@@ -35,14 +35,18 @@ final class SpotlightSearch: NSObject {
     @ObservationIgnored private var query: NSMetadataQuery?
 
     func start(text: String, field: SpotlightField, directories: [URL]?) {
+        let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        start(predicate: value.isEmpty ? nil : field.predicate(for: value), directories: directories)
+    }
+
+    func start(predicate: NSPredicate?, directories: [URL]?) {
         cancel()
         hits = []
         completed = false
         error = nil
-        let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !value.isEmpty else { return }
+        guard let predicate else { return }
         let metadata = NSMetadataQuery()
-        metadata.predicate = field.predicate(for: value)
+        metadata.predicate = predicate
         if let directories {
             metadata.searchScopes = Array(Set(directories.map { $0.resolvingSymlinksInPath() }))
         } else {

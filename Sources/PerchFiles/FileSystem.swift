@@ -11,6 +11,7 @@ struct FileEntry: Identifiable, Equatable, Sendable {
     let size: Int?
     let contentType: UTType?
     let sourceLanguage: SourceLanguage?
+    let cloudStatus: CloudFileState?
 
     var id: URL { url }
     var sizeLabel: String {
@@ -34,7 +35,8 @@ struct FileEntry: Identifiable, Equatable, Sendable {
         let linkTarget = isLink ? try? url.resolvingSymlinksInPath().resourceValues(forKeys: [.isDirectoryKey, .isPackageKey]) : nil
         let isFolder = !isPackage && (info?.isDirectory == true
             || (linkTarget?.isDirectory == true && linkTarget?.isPackage != true))
-        let language = isFolder || isPackage ? nil : SourceLanguage.detect(url)
+        let cloud = CloudFileState(info)
+        let language = isFolder || isPackage ? nil : SourceLanguage.detect(url, probesContent: cloud != .online)
         let kind: String
         if isLink {
             kind = "符号链接"
@@ -54,7 +56,8 @@ struct FileEntry: Identifiable, Equatable, Sendable {
         return Self(
             url: logicalURL ?? url, name: info?.localizedName ?? filename, filename: filename,
             isFolder: isFolder, kind: kind, modified: info?.contentModificationDate,
-            size: (isFolder || isPackage) ? nil : info?.fileSize, contentType: type, sourceLanguage: language
+            size: (isFolder || isPackage) ? nil : info?.fileSize, contentType: type, sourceLanguage: language,
+            cloudStatus: cloud
         )
     }
 }
@@ -80,7 +83,9 @@ enum FileSystem {
 
     static let keys: Set<URLResourceKey> = [
         .localizedNameKey, .isDirectoryKey, .isPackageKey, .isSymbolicLinkKey,
-        .contentTypeKey, .contentModificationDateKey, .fileSizeKey
+        .contentTypeKey, .contentModificationDateKey, .fileSizeKey, .isUbiquitousItemKey,
+        .ubiquitousItemDownloadingStatusKey, .ubiquitousItemIsDownloadingKey, .ubiquitousItemIsUploadingKey,
+        .ubiquitousItemDownloadingErrorKey, .ubiquitousItemUploadingErrorKey
     ]
 
     static func physicalDirectory(_ directory: URL) -> URL {
@@ -116,27 +121,53 @@ enum FileSystem {
         }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 
-    static func search(_ directory: URL, query: String, showHidden: Bool) throws -> FolderSearchResults {
+    static func search(_ directory: URL, query: String, showHidden: Bool, recursive: Bool = true,
+                       includesCandidate: (URL) -> Bool = { _ in true },
+                       includesEntry: (FileEntry) -> Bool = { _ in true },
+                       reportProgress: ((FolderSearchProgress) -> Void)? = nil) throws -> FolderSearchResults {
         var options: FileManager.DirectoryEnumerationOptions = [.skipsPackageDescendants]
         if !showHidden { options.insert(.skipsHiddenFiles) }
+        if !recursive { options.insert(.skipsSubdirectoryDescendants) }
         let location = DirectoryLocation(directory)
         var unreadable = 0
+        var rootError: Error?
         guard let iterator = FileManager.default.enumerator(at: location.disk,
-                includingPropertiesForKeys: Array(keys), options: options, errorHandler: { _, _ in
+                includingPropertiesForKeys: [], options: options, errorHandler: { url, error in
+                    if url.path == location.disk.path {
+                        rootError = error
+                        return false
+                    }
                     unreadable += 1
                     return !Task.isCancelled
                 }) else { throw CocoaError(.fileReadUnknown) }
         var matches: [FileEntry] = []
+        var scanned = 0
+        var showedFirstMatches = false
+        let interval = Duration.milliseconds(180)
+        var nextUpdate = ContinuousClock.now + interval
         for case let url as URL in iterator {
             try Task.checkCancellation()
-            let filename = url.lastPathComponent
-            let name = (try? url.resourceValues(forKeys: [.localizedNameKey]))?.localizedName ?? filename
-            if FileListing.matches(name: name, filename: filename, query: query) {
-                matches.append(FileEntry.read(url, presentedAs: location.logicalURL(for: url)))
+            scanned += 1
+            if includesCandidate(url), searchNameMatches(url, query: query) {
+                let entry = FileEntry.read(url, presentedAs: location.logicalURL(for: url))
+                if includesEntry(entry) { matches.append(entry) }
+            }
+            if let reportProgress, scanned.isMultiple(of: 64), ContinuousClock.now >= nextUpdate {
+                let firstMatches = !showedFirstMatches && !matches.isEmpty ? Array(matches.prefix(32)) : nil
+                if firstMatches != nil { showedFirstMatches = true }
+                reportProgress(FolderSearchProgress(scanned: scanned, firstMatches: firstMatches))
+                nextUpdate = ContinuousClock.now + interval
             }
         }
         try Task.checkCancellation()
+        if let rootError { throw rootError }
         return FolderSearchResults(entries: matches, unreadable: unreadable)
+    }
+
+    private static func searchNameMatches(_ url: URL, query: String) -> Bool {
+        if query.isEmpty || url.lastPathComponent.localizedStandardContains(query) { return true }
+        let name = (try? url.resourceValues(forKeys: [.localizedNameKey]))?.localizedName
+        return name?.localizedStandardContains(query) == true
     }
 
     static func locationKey(_ url: URL) -> String {

@@ -8,6 +8,8 @@ struct archive;
 struct archive_entry;
 struct archive *archive_read_new(void);
 int archive_read_support_format_zip_seekable(struct archive *);
+int archive_read_support_format_all(struct archive *);
+int archive_read_support_filter_all(struct archive *);
 int archive_read_open_filename(struct archive *, const char *, size_t);
 int archive_read_next_header(struct archive *, struct archive_entry **);
 int archive_read_data_into_fd(struct archive *, int);

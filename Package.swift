@@ -5,5 +5,8 @@ let package = Package(
     name: "PerchFiles",
     platforms: [.macOS(.v14)],
     products: [.executable(name: "PerchFiles", targets: ["PerchFiles"])],
-    targets: [.systemLibrary(name: "CArchive"), .executableTarget(name: "PerchFiles", dependencies: ["CArchive"])]
+    targets: [
+        .systemLibrary(name: "CArchive"),
+        .executableTarget(name: "PerchFiles", dependencies: ["CArchive"], resources: [.copy("Resources/Markdown")])
+    ]
 )
