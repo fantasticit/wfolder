@@ -28,6 +28,7 @@ if [[ "$configuration" == release ]]; then flags=(-O -whole-module-optimization)
 
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" "$iconset" "$project/dist"
 ditto Scripts/Templates "$app/Contents/Resources/Templates"
+ditto Sources/PerchFiles/Resources/Markdown "$app/Contents/Resources/Markdown"
 xcrun swift Scripts/MakeIcon.swift "$stage/Perch.png"
 for size in 16 32 128 256 512; do
     sips -z "$size" "$size" "$stage/Perch.png" --out "$iconset/icon_${size}x${size}.png" >/dev/null

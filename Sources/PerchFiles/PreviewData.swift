@@ -10,11 +10,14 @@ struct PreparedPDF: @unchecked Sendable {
 
 enum PreviewData: Sendable {
     case text(String, monospaced: Bool, highlights: [SyntaxSpan])
+    case markdown(String)
     case paged(PagedPreviewSource)
     case workbook(XLSXWorkbook)
     case workbookError(String)
     case image(CGImage)
     case pdf(PreparedPDF)
+    case word(PreparedWord)
+    case font(FontSpecimen)
     case media(MediaKind)
     case applicationIcon
     case quickLook
@@ -34,6 +37,7 @@ enum PreviewData: Sendable {
             do { return .workbook(try XLSXWorkbook.read(url)) }
             catch { return .workbookError(error.localizedDescription) }
         }
+        if entry.isMarkdown { return loadMarkdown(url) }
         if let language = entry.sourceLanguage {
             return loadText(url, ext: ext, mode: .text(monospaced: true, language: language))
         }
@@ -42,9 +46,17 @@ enum PreviewData: Sendable {
             guard let document = PDFDocument(url: url) else { return .quickLook }
             return .pdf(PreparedPDF(document: document))
         }
+        if ext == "docx" || type?.identifier == "org.openxmlformats.wordprocessingml.document" {
+            guard let document = PreparedWord(url: url) else { return .quickLook }
+            return .word(document)
+        }
+        if ext == "otf" || ext == "ttf" {
+            guard let specimen = FontSpecimen(url: url) else { return .quickLook }
+            return .font(specimen)
+        }
         if let mediaKind = entry.mediaKind { return .media(mediaKind) }
         if [
-            "doc", "docx", "xls", "ppt", "pptx", "pages", "numbers", "key", "rtf", "rtfd",
+            "doc", "xls", "ppt", "pptx", "pages", "numbers", "key", "rtf", "rtfd",
             "svg", "gif"
         ].contains(ext) { return .quickLook }
 
@@ -57,12 +69,24 @@ enum PreviewData: Sendable {
                kCGImageSourceShouldCacheImmediately: true
            ] as CFDictionary) { return .image(thumbnail) }
 
-        let sourceFormats = ["csv", "tsv", "txt", "md", "markdown", "log", "conf"]
+        let sourceFormats = ["csv", "tsv", "txt", "log", "conf"]
         guard sourceFormats.contains(ext) || type?.conforms(to: .text) == true else { return .quickLook }
         let mode: PreviewPageMode = ext == "csv" || ext == "tsv"
             ? .delimited(separator: ext == "csv" ? 44 : 9)
             : .text(monospaced: ext != "txt")
         return loadText(url, ext: ext, mode: mode)
+    }
+
+    private nonisolated static func loadMarkdown(_ url: URL) -> Self {
+        do {
+            guard let source = try PagedPreviewSource(url: url, mode: .text(monospaced: true)) else {
+                return .quickLook
+            }
+            if let text = try source.smallText(maxBytes: 2 * 1024 * 1024) { return .markdown(text) }
+            return .paged(source)
+        } catch {
+            return .quickLook
+        }
     }
 
     private nonisolated static func loadText(_ url: URL, ext: String, mode: PreviewPageMode) -> Self {

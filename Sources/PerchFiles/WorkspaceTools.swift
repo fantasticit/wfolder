@@ -3,6 +3,7 @@ import UniformTypeIdentifiers
 
 enum WorkspaceTool: Identifiable {
     case workspaces, batchRename(BrowserModel, [FileEntry]), compare, spotlight, goToPath
+    case advancedSearch(SmartFolder?), commands, remote, organization, organizationDraft(OrganizationRule), aiAssistant
 
     var id: String {
         switch self {
@@ -11,6 +12,12 @@ enum WorkspaceTool: Identifiable {
         case .compare: return "compare"
         case .spotlight: return "spotlight"
         case .goToPath: return "goToPath"
+        case .advancedSearch(let folder): return folder?.id.uuidString ?? "advancedSearch"
+        case .commands: return "commands"
+        case .remote: return "remote"
+        case .organization: return "organization"
+        case .organizationDraft(let rule): return "organizationDraft-\(rule.id)"
+        case .aiAssistant: return "aiAssistant"
         }
     }
 }

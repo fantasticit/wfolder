@@ -1,8 +1,8 @@
 import SwiftUI
 
-struct BatchRenameRule: Equatable, Sendable {
-    enum Style: String, CaseIterable, Identifiable, Sendable {
-        case replace = "替换文字", prefix = "添加前缀", sequence = "顺序编号"
+struct BatchRenameRule: Codable, Equatable, Sendable {
+    enum Style: String, Codable, CaseIterable, Identifiable, Sendable {
+        case replace = "替换文字", prefix = "添加前缀", sequence = "顺序编号", modifiedDate = "修改日期前缀"
         var id: Self { self }
     }
 
@@ -24,6 +24,10 @@ struct BatchRenameRule: Equatable, Sendable {
         case .sequence:
             guard let first = Int(start), (0...999_999_999).contains(first) else { return "" }
             newName = text + String(format: "%03d", first + index)
+        case .modifiedDate:
+            guard let modified = entry.modified else { return "" }
+            let date = modified.formatted(.iso8601.year().month().day().dateSeparator(.dash))
+            newName = date + "_" + stem
         }
         guard !newName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return "" }
         return fileExtension.isEmpty ? newName : newName + "." + fileExtension
@@ -151,7 +155,9 @@ struct BatchRenameView: View {
             }
             .pickerStyle(.segmented)
             HStack {
-                TextField(rule.style == .replace ? "查找文字" : "前缀", text: $rule.text)
+                if rule.style != .modifiedDate {
+                    TextField(rule.style == .replace ? "查找文字" : "前缀", text: $rule.text)
+                }
                 if rule.style == .replace { TextField("替换为", text: $rule.replacement) }
                 if rule.style == .sequence { TextField("起始编号", text: $rule.start).frame(width: 120) }
             }

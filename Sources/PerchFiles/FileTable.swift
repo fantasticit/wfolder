@@ -25,7 +25,7 @@ struct FileTable: NSViewRepresentable {
         table.intercellSpacing = NSSize(width: 3, height: 1)
         table.usesAlternatingRowBackgroundColors = true
         table.columnAutoresizingStyle = .noColumnAutoresizing
-        table.allowsColumnReordering = false
+        table.allowsColumnReordering = true
         table.allowsColumnResizing = true
         table.floatsGroupRows = false
         table.allowsEmptySelection = true
@@ -88,14 +88,17 @@ struct FileTable: NSViewRepresentable {
         let groupingChanged = coordinator.groupedRows?.id != groupedRows?.id
         let locationChanged = coordinator.showsLocation != showsLocation
         let extensionsChanged = coordinator.showExtensions != settings.showExtensions
+        let showsCheckboxes = settings.showsSelectionCheckboxes == true
+        let checkboxesChanged = coordinator.showsCheckboxes != showsCheckboxes
         coordinator.showExtensions = settings.showExtensions
+        coordinator.showsCheckboxes = showsCheckboxes
         let rowHeight: CGFloat = showsLocation ? (settings.compactRows ? 36 : 42) : (settings.compactRows ? 22 : 29)
         if table.rowHeight != rowHeight { table.rowHeight = rowHeight }
         if locationChanged {
             coordinator.showsLocation = showsLocation
             coordinator.needsScrollReset = true
         }
-        if listingChanged || groupingChanged || locationChanged || extensionsChanged {
+        if listingChanged || groupingChanged || locationChanged || extensionsChanged || checkboxesChanged {
             coordinator.listingID = listing.id
             coordinator.entries = listing.entries
             coordinator.groupedRows = groupedRows
@@ -126,9 +129,14 @@ struct FileTable: NSViewRepresentable {
             table.selectRowIndexes(rows, byExtendingSelection: false)
             if let first = rows.first { table.scrollRowToVisible(first) }
         }
+        coordinator.updateCheckboxes(in: table)
     }
 
     private func updateColumns(_ table: NSTableView) {
+        for (target, field) in settings.orderedColumns.enumerated() {
+            let index = table.column(withIdentifier: NSUserInterfaceItemIdentifier(field.rawValue))
+            if index >= 0, index != target { table.moveColumn(index, toColumn: target) }
+        }
         let otherWidth = FileColumn.allCases.reduce(CGFloat(0)) { result, field in
             guard field != .name, !settings.hiddenColumns.contains(field) else { return result }
             return result + (settings.columnWidths[field] ?? Self.width(for: field)) + table.intercellSpacing.width
@@ -168,6 +176,7 @@ struct FileTable: NSViewRepresentable {
         var focusRequest = 0
         var showsLocation = false
         var showExtensions = true
+        var showsCheckboxes = false
 
         init(actions: BrowserFileActions) { self.actions = actions }
 
@@ -196,7 +205,16 @@ struct FileTable: NSViewRepresentable {
             guard !applying, let column = notification.userInfo?["NSTableColumn"] as? NSTableColumn,
                   let field = FileColumn(rawValue: column.identifier.rawValue) else { return }
             let width = column.width
-            DispatchQueue.main.async { [weak self] in self?.model.viewSettings.columnWidths[field] = width }
+            let directory = model.directory
+            DispatchQueue.main.async { [weak self] in
+                guard self?.model.directory == directory else { return }
+                self?.model.viewSettings.columnWidths[field] = width
+            }
+        }
+
+        func tableViewColumnDidMove(_ notification: Notification) {
+            guard !applying, let table = notification.object as? NSTableView else { return }
+            model.viewSettings.columnOrder = table.tableColumns.compactMap { FileColumn(rawValue: $0.identifier.rawValue) }
         }
 
         func tableView(_ tableView: NSTableView, isGroupRow row: Int) -> Bool { heading(at: row) != nil }
@@ -228,12 +246,31 @@ struct FileTable: NSViewRepresentable {
             let cell = tableView.makeView(withIdentifier: tableColumn.identifier, owner: nil) as? FileCell
                 ?? FileCell(field: field)
             cell.configure(entry, showsLocation: showsLocation, showExtensions: showExtensions)
+            if field == .name {
+                cell.configureCheckbox(visible: showsCheckboxes, name: entry.filename,
+                                       selected: tableView.selectedRowIndexes.contains(row)) { [weak self, weak tableView] in
+                    guard let self, let tableView, self.entry(at: row)?.id == entry.id else { return }
+                    self.actions.activate()
+                    if tableView.selectedRowIndexes.contains(row) { tableView.deselectRow(row) }
+                    else { tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: true) }
+                }
+            }
             return cell
         }
 
         func tableViewSelectionDidChange(_ notification: Notification) {
             guard !applying, let table = notification.object as? NSTableView else { return }
             model.select(Set(entries(at: table.selectedRowIndexes).map(\.id)))
+            updateCheckboxes(in: table)
+        }
+
+        func updateCheckboxes(in table: NSTableView) {
+            let column = table.column(withIdentifier: NSUserInterfaceItemIdentifier(FileColumn.name.rawValue))
+            guard showsCheckboxes, column >= 0 else { return }
+            table.enumerateAvailableRowViews { _, row in
+                let cell = table.view(atColumn: column, row: row, makeIfNecessary: false) as? FileCell
+                cell?.setCheckboxSelected(table.selectedRowIndexes.contains(row))
+            }
         }
 
         @objc func openClickedRow(_ table: NSTableView) {
@@ -294,6 +331,8 @@ private final class FileCell: NSTableCellView {
     private let field: FileColumn
     private let label = NSTextField(labelWithString: "")
     private let icon = NSImageView()
+    private let checkbox = FileSelectionCheckbox()
+    private var checkboxWidth: NSLayoutConstraint?
     private var locationLabel: NSTextField?
     private var tint: NSColor = .secondaryLabelColor
 
@@ -315,8 +354,14 @@ private final class FileCell: NSTableCellView {
             icon.imageScaling = .scaleProportionallyDown
             imageView = icon
             addSubview(icon)
+            addSubview(checkbox)
+            let width = checkbox.widthAnchor.constraint(equalToConstant: 0)
+            checkboxWidth = width
             NSLayoutConstraint.activate([
-                icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
+                checkbox.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
+                checkbox.centerYAnchor.constraint(equalTo: centerYAnchor),
+                width,
+                icon.leadingAnchor.constraint(equalTo: checkbox.trailingAnchor, constant: 2),
                 icon.centerYAnchor.constraint(equalTo: centerYAnchor),
                 icon.widthAnchor.constraint(equalToConstant: 18),
                 icon.heightAnchor.constraint(equalToConstant: 18)
@@ -355,6 +400,13 @@ private final class FileCell: NSTableCellView {
     }
 
     required init?(coder: NSCoder) { nil }
+
+    func configureCheckbox(visible: Bool, name: String, selected: Bool, onToggle: @escaping () -> Void) {
+        checkboxWidth?.constant = visible ? 19 : 0
+        checkbox.configure(visible: visible, name: name, selected: selected, onToggle: onToggle)
+    }
+
+    func setCheckboxSelected(_ selected: Bool) { checkbox.state = selected ? .on : .off }
 
     override var backgroundStyle: NSView.BackgroundStyle {
         didSet { updateColors() }
@@ -396,7 +448,7 @@ private final class FileCell: NSTableCellView {
             toolTip = showsLocation ? entry.filename + "\n" + path : entry.filename
             return
         case .kind:
-            label.stringValue = entry.kind
+            label.stringValue = entry.cloudStatus.map { entry.kind + " · " + $0.rawValue } ?? entry.kind
         case .modified:
             label.stringValue = entry.modified?.formatted(date: .abbreviated, time: .omitted) ?? "—"
         case .size:

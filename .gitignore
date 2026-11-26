@@ -1,3 +1,4 @@
 .build/
 dist/
 .DS_Store
+/Scripts/Markdown/node_modules/

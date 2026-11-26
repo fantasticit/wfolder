@@ -71,7 +71,9 @@ enum FileArchive {
     }
 
     private static func withStaging(in directory: URL, _ operation: (URL) throws -> URL) throws -> URL {
-        let staging = directory.appendingPathComponent(".perch-" + UUID().uuidString, isDirectory: true)
+        let location = try TransferFiles.Destination(directory)
+        let parent = location.isNetwork ? FileManager.default.temporaryDirectory : directory
+        let staging = parent.appendingPathComponent(".perch-" + UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: false,
                                                 attributes: [.posixPermissions: 0o700])
         defer { try? FileManager.default.removeItem(at: staging) }
@@ -83,7 +85,7 @@ enum FileArchive {
             let suffix = number == 1 ? "" : " \(number)"
             let destination = directory.appendingPathComponent(name + suffix + ext)
             do {
-                try FileSystem.moveExclusive(from: temporary, to: destination)
+                try TransferFiles.publish(temporary, to: destination)
                 return destination
             } catch let error as NSError where error.domain == NSPOSIXErrorDomain && error.code == Int(EEXIST) {
                 continue

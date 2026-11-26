@@ -22,7 +22,7 @@ enum SourceLanguage: String, CaseIterable, Sendable {
         "json": .json, "jsonc": .json, "jsonl": .json, "yaml": .yaml, "yml": .yaml, "toml": .toml, "ini": .ini
     ]
 
-    static func detect(_ url: URL) -> Self? {
+    static func detect(_ url: URL, probesContent: Bool = true) -> Self? {
         let name = url.lastPathComponent.lowercased()
         switch name {
         case "makefile", "gnumakefile": return .make
@@ -34,7 +34,7 @@ enum SourceLanguage: String, CaseIterable, Sendable {
         if name.hasPrefix("dockerfile.") || name.hasPrefix("containerfile.") { return .docker }
         let ext = url.pathExtension.lowercased()
         if ext == "ts" || ext == "mts" {
-            return PagedPreviewSource.isTypeScriptText(url) ? .typescript : nil
+            return probesContent && PagedPreviewSource.isTypeScriptText(url) ? .typescript : nil
         }
         return extensions[ext]
     }

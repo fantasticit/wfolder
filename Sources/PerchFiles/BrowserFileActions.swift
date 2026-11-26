@@ -8,17 +8,23 @@ struct BrowserFileActions {
     func activate() { workspace.activatePane(model) }
 
     func open(_ entry: FileEntry) {
-        if model.isStash, entry.isFolder { workspace.navigateToFolder(entry.url) }
+        if model.isVirtual, entry.isFolder { workspace.navigateToFolder(entry.url) }
+        else if !entry.isFolder, ZipContents.supports(entry.url) { workspace.openArchivePane(entry) }
         else { model.openEntry(entry) }
     }
 
     func configureDrop(in scroll: FileDropScrollView, folderAt: @escaping (NSPoint) -> URL?) {
-        scroll.registerForDraggedTypes([.fileURL])
+        scroll.registerForDraggedTypes([.fileURL, ArchiveDrag.pasteboardType])
         if model.isStash {
             scroll.storeInStash = { workspace.storeInStash($0) }
         } else {
             scroll.canReceive = { model.canQueueTransfer }
             scroll.destination = { folderAt($0) ?? model.directory }
+            scroll.receiveArchive = { archive, directory in
+                guard model.canQueueTransfer, !model.busy, !workspace.isTransferring, let entry = archive.archiveEntry() else { return false }
+                model.extractZip(entry, paths: archive.members, folder: archive.folder, into: directory) { _ in }
+                return true
+            }
             scroll.receive = { urls, directory, operation, fromStash in
                 workspace.transfer(urls, into: directory, operation: operation, fromStash: fromStash)
             }
@@ -32,8 +38,21 @@ struct BrowserFileActions {
     }
 
     func handleShortcut(_ event: NSEvent, items: @autoclosure () -> [FileEntry]) -> Bool {
-        guard event.modifierFlags.intersection([.command, .option, .shift, .control]) == .command else { return false }
+        let modifiers = event.modifierFlags.intersection([.command, .option, .shift, .control])
+        if workspace.windowsKeyBindings, modifiers == .option {
+            switch event.keyCode {
+            case 123: model.back(); return true
+            case 124: model.forward(); return true
+            case 126:
+                if let parent = model.parent { model.navigate(to: parent) }
+                return true
+            default: break
+            }
+        }
+        guard modifiers == .command || (workspace.windowsKeyBindings && modifiers == .control) else { return false }
         switch event.charactersIgnoringModifiers?.lowercased() {
+        case "a":
+            model.selectAllResults()
         case "c":
             let selected = items()
             guard !selected.isEmpty else { return false }
@@ -54,8 +73,12 @@ struct BrowserFileActions {
         guard event.modifierFlags.intersection([.command, .option, .shift, .control]).isEmpty else { return false }
         switch event.keyCode {
         case 36, 76:
+            guard let entry = entry(), workspace.windowsKeyBindings || model.canRenameItems else { return false }
+            if workspace.windowsKeyBindings { open(entry) } else { model.askRename(entry) }
+        case 120 where workspace.windowsKeyBindings:
             guard let entry = entry(), model.canRenameItems else { return false }
             model.askRename(entry)
+        case 96 where workspace.windowsKeyBindings: model.refresh()
         case 49:
             guard let entry = entry() else { return false }
             if entry.isFolder { model.showPreview = true }
@@ -69,93 +92,147 @@ struct BrowserFileActions {
         let menu = NSMenu()
         menu.autoenablesItems = false
         let canModify = model.canModifyDirectory
-        if model.isStash { return stashMenu(for: items, menu: menu) }
         guard !items.isEmpty else {
-            menu.addItem(action("新建文件…", "doc.badge.plus", enabled: canModify) { self.model.askNewFile() })
-            menu.addItem(action("新建文件夹…", "folder.badge.plus", enabled: canModify) { self.model.askNewFolder() })
-            menu.addItem(.separator())
-            menu.addItem(action("粘贴", "doc.on.clipboard", enabled: model.canPaste) { self.model.paste() })
+            if !model.isVirtual {
+                menu.addItem(action("新建文件…", "doc.badge.plus", enabled: canModify) { model.askNewFile() })
+                menu.addItem(action("新建文件夹…", "folder.badge.plus", enabled: canModify) { model.askNewFolder() })
+                menu.addItem(action("粘贴", "doc.on.clipboard", enabled: model.canPaste) { model.paste() })
+                menu.addItem(.separator())
+            }
+            menu.addItem(action("全选当前结果", enabled: !model.visibleEntries.isEmpty) { model.selectAllResults() })
+            menu.addItem(action("反向选择", enabled: !model.visibleEntries.isEmpty) { model.invertSelection() })
             return menu
         }
+
         let entry = items.count == 1 ? items.first : nil
         if let entry {
-            menu.addItem(action("打开", entry.isFolder ? "folder" : "arrow.up.right.square") { self.open(entry) })
-            if !entry.isFolder, ZipContents.supports(entry.url) {
-                menu.addItem(action("用默认应用打开", "arrow.up.right.square") { model.openWithDefaultApp(entry) })
-            }
-            if showsLocation {
-                menu.addItem(action("前往所在文件夹", "folder") { self.model.showContainingFolder(of: entry) })
-            }
-            if entry.isFolder {
-                menu.addItem(action("在新标签页中打开", "plus.rectangle.on.rectangle") { workspace.openTab(at: entry.url) })
-            } else {
-                menu.addItem(action("快速预览", "eye") { self.model.expandedPreview = entry })
-            }
-            menu.addItem(.separator())
-            menu.addItem(action("重命名…", "pencil", enabled: canModify) { self.model.askRename(entry) })
+            menu.addItem(action("打开", entry.isFolder ? "folder" : "arrow.up.right.square") { open(entry) })
         }
-        if items.count > 1 {
-            menu.addItem(action("批量重命名…", "pencil", enabled: canModify) {
-                workspace.presentedTool = .batchRename(model, items)
+        menu.addItem(openWithMenu(for: items, single: entry))
+        if let entry, showsLocation || model.isStash {
+            menu.addItem(action("前往所在文件夹", "folder") { workspace.revealInFolder(entry.url) })
+        }
+        menu.addItem(.separator())
+        if !model.isStash {
+            menu.addItem(action("剪切", "scissors", enabled: model.canQueueTransfer) { model.copy(items, cut: true) })
+        }
+        menu.addItem(action("复制", "doc.on.doc") { model.copy(items) })
+        if !model.isStash, model.canPaste {
+            menu.addItem(action("粘贴到当前文件夹", "doc.on.clipboard") { model.paste() })
+        }
+        for operation in [PaneTransferOperation.copy, .move] {
+            menu.addItem(action("\(operation.title)到…", operation == .copy ? "doc.on.doc" : "arrow.right",
+                                enabled: !model.busy) {
+                workspace.chooseTransferDestination(operation, items: items, from: model)
             })
         }
-        menu.addItem(airDropItem(for: items))
-        menu.addItem(action("加入暂存架", "tray.and.arrow.down") { workspace.storeInStash(items.map(\.url)) })
-        menu.addItem(action("剪切", "scissors", enabled: model.canQueueTransfer) { self.model.copy(items, cut: true) })
-        menu.addItem(action("复制", "doc.on.doc") { self.model.copy(items) })
-        menu.addItem(action("粘贴到当前文件夹", "doc.on.clipboard", enabled: model.canPaste) { self.model.paste() })
-        let targets = workspace.transferTargets(from: model)
-        if !targets.isEmpty {
-            menu.addItem(.separator())
-            let urls = items.map(\.url)
-            addTransfer(.copy, targets: targets, urls: urls, to: menu)
-            addTransfer(.move, targets: targets, urls: urls, to: menu)
-        }
         if let entry {
-            menu.addItem(action("制作副本", "plus.square.on.square", enabled: canModify) { self.model.duplicate(entry) })
-            menu.addItem(action("复制路径", "link") { self.model.copyPath(entry) })
+            menu.addItem(action("重命名…", "pencil", enabled: model.canRenameItems) { model.askRename(entry) })
+        }
+        if model.isStash {
+            menu.addItem(action("移出暂存架", "tray.and.arrow.up") { workspace.removeFromStash(items.map(\.url)) })
+        } else {
+            menu.addItem(action("移到废纸篓…", "trash", enabled: canModify) { model.askTrash(items) })
         }
         menu.addItem(.separator())
-        menu.addItem(action("压缩为 ZIP", "archivebox", enabled: canModify) { self.model.compress(items) })
-        if let entry, !entry.isFolder, FileArchive.canExtract(entry.url) {
-            menu.addItem(action("解压到当前文件夹", "archivebox.fill", enabled: canModify) { self.model.extract(entry) })
-        }
-        if let entry, entry.isFolder {
-            let title = model.isFavorite(entry.url) ? "取消收藏" : "添加到收藏"
-            menu.addItem(action(title, model.isFavorite(entry.url) ? "star.slash" : "star") { self.model.toggleFavorite(entry.url) })
-        }
-        menu.addItem(.separator())
-        menu.addItem(action("移到废纸篓…", "trash", enabled: canModify) { self.model.askTrash(items) })
+        menu.addItem(submenu("更多操作", icon: "ellipsis", items: moreActions(for: items, single: entry)))
         return menu
     }
 
-    private func stashMenu(for items: [FileEntry], menu: NSMenu) -> NSMenu {
-        let urls = items.map(\.url)
-        if let entry = items.count == 1 ? items.first : nil {
-            if entry.isFolder {
-                menu.addItem(action("打开文件夹", "folder") { open(entry) })
-            } else {
-                menu.addItem(action("用默认应用打开", "arrow.up.right.square") { model.openWithDefaultApp(entry) })
-                menu.addItem(action("快速预览", "eye") { model.expandedPreview = entry })
-                if ZipContents.supports(entry.url) {
-                    menu.addItem(action("浏览 ZIP", "archivebox") { open(entry) })
-                }
+    private func openWithMenu(for items: [FileEntry], single entry: FileEntry?) -> NSMenuItem {
+        let system = NSWorkspace.shared
+        var options: [NSMenuItem] = []
+        if let entry {
+            let defaultURL = system.urlForApplication(toOpen: entry.url)
+            let name = defaultURL.map { FileManager.default.displayName(atPath: $0.path) }
+            options.append(action(name.map { "默认应用 · \($0)" } ?? "默认应用", "arrow.up.right.square") {
+                model.openWithDefaultApp(entry)
+            })
+            options.append(visualStudioCodeItem(for: items))
+            var seen = Set([Bundle.main.bundleIdentifier, "com.microsoft.VSCode",
+                            defaultURL.flatMap { Bundle(url: $0)?.bundleIdentifier }].compactMap { $0 })
+            let apps = system.urlsForApplications(toOpen: entry.url).sorted {
+                $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending
             }
-            menu.addItem(action("前往所在文件夹", "folder") { workspace.revealInFolder(entry.url) })
-            menu.addItem(action("重命名…", "pencil", enabled: model.canRenameItems) { model.askRename(entry) })
-            menu.addItem(action("复制路径", "link") { model.copyPath(entry) })
-            menu.addItem(.separator())
+            let compatible = apps.compactMap { app -> NSMenuItem? in
+                let identifier = Bundle(url: app)?.bundleIdentifier ?? app.path
+                guard seen.insert(identifier).inserted, app != defaultURL else { return nil }
+                return action(FileManager.default.displayName(atPath: app.path)) { model.open(items, using: app) }
+            }
+            if !compatible.isEmpty { options += [.separator()] + compatible }
+        } else {
+            options.append(action("默认应用") { for item in items { model.openWithDefaultApp(item) } })
+            options.append(visualStudioCodeItem(for: items))
         }
-        guard !urls.isEmpty else { return menu }
-        menu.addItem(airDropItem(for: items))
-        menu.addItem(action("复制", "doc.on.doc") { model.copy(items) })
+        return submenu("打开方式", icon: "arrow.up.right.square", items: options)
+    }
+
+    private func moreActions(for items: [FileEntry], single entry: FileEntry?) -> [NSMenuItem] {
+        let canModify = model.canModifyDirectory
+        var options = [airDropItem(for: items)]
+        if let entry {
+            options.append(action(entry.isFolder ? "在新标签页中打开" : "快速预览",
+                                  entry.isFolder ? "plus.rectangle.on.rectangle" : "eye") {
+                if entry.isFolder { workspace.openTab(at: entry.url) }
+                else { model.expandedPreview = entry }
+            })
+            options.append(action("复制路径", "link") { model.copyPath(entry) })
+            let pinned = model.isFavorite(entry.url)
+            options.append(action(pinned ? "取消固定" : "固定到快速访问", pinned ? "pin.slash" : "pin") {
+                model.toggleFavorite(entry.url, isFolder: entry.isFolder)
+            })
+            if model.isStash, ZipContents.supports(entry.url), !entry.isFolder {
+                options.append(action("浏览 ZIP", "archivebox") { open(entry) })
+            }
+        } else if !model.isStash {
+            options.append(action("批量重命名…", "pencil", enabled: canModify) {
+                workspace.presentedTool = .batchRename(model, items)
+            })
+        }
+        let urls = items.map(\.url)
         let targets = workspace.transferTargets(from: model)
         if !targets.isEmpty {
-            addTransfer(.copy, targets: targets, urls: urls, to: menu)
-            addTransfer(.move, targets: targets, urls: urls, to: menu)
+            let transfers = NSMenu()
+            addTransfer(.copy, targets: targets, urls: urls, to: transfers)
+            addTransfer(.move, targets: targets, urls: urls, to: transfers)
+            options += transfers.items
+            transfers.removeAllItems()
         }
-        menu.addItem(action("移出暂存架", "tray.and.arrow.up") { workspace.removeFromStash(urls) })
-        return menu
+        if !model.isStash {
+            options.append(action("加入暂存架", "tray.and.arrow.down") { workspace.storeInStash(urls) })
+            if let entry {
+                options.append(action("制作副本", "plus.square.on.square", enabled: canModify) { model.duplicate(entry) })
+                if entry.cloudStatus == .online {
+                    options.append(action("下载到本机", "icloud.and.arrow.down") {
+                        do { try FileManager.default.startDownloadingUbiquitousItem(at: entry.url); model.refresh() }
+                        catch { model.issue = BrowserIssue(title: "无法下载文件", message: error.localizedDescription) }
+                    })
+                }
+                if !entry.isFolder, FileArchive.canExtract(entry.url) {
+                    options.append(action("解压到当前文件夹", "archivebox.fill", enabled: canModify) { model.extract(entry) })
+                }
+            }
+            options.append(action("压缩为 ZIP", "archivebox", enabled: canModify) { model.compress(items) })
+        }
+        options.append(action("全选当前结果") { model.selectAllResults() })
+        options.append(action("反向选择") { model.invertSelection() })
+        return options
+    }
+
+    private func submenu(_ title: String, icon: String, items: [NSMenuItem]) -> NSMenuItem {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        for item in items { menu.addItem(item) }
+        let parent = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        parent.image = NSImage(systemSymbolName: icon, accessibilityDescription: nil)
+        parent.submenu = menu
+        return parent
+    }
+
+    private func visualStudioCodeItem(for items: [FileEntry]) -> NSMenuItem {
+        action("在 Visual Studio Code 中打开", "chevron.left.forwardslash.chevron.right") {
+            model.openInVisualStudioCode(items)
+        }
     }
 
     private func airDropItem(for items: [FileEntry]) -> NSMenuItem {

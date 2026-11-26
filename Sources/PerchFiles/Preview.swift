@@ -9,7 +9,7 @@ struct PreviewPane: View {
     @ViewState private var showInfo = false
 
     var body: some View {
-        let entry = model.selected
+        let entry = model.archivePreview ?? model.selected
         VStack(spacing: 0) {
             HStack {
                 Text("预览").font(.headline).accessibilityAddTraits(.isHeader)
@@ -80,6 +80,9 @@ struct PreviewPane: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                if let status = entry.cloudStatus {
+                    Label(status.rawValue, systemImage: status.symbol).font(.caption).foregroundStyle(.secondary)
+                }
             }
             Spacer(minLength: 4)
             Button("文件信息", systemImage: "info.circle") { showInfo.toggle() }
@@ -91,6 +94,7 @@ struct PreviewPane: View {
                         Text(entry.name).font(.headline).lineLimit(2)
                         Divider()
                         LabeledContent("类型", value: entry.kind)
+                        if let status = entry.cloudStatus { LabeledContent("云端状态", value: status.rawValue) }
                         if entry.size != nil { LabeledContent("大小", value: entry.sizeLabel) }
                         if let modified = entry.modified {
                             LabeledContent("修改时间", value: modified.formatted(date: .abbreviated, time: .shortened))
@@ -130,6 +134,12 @@ struct FilePreview: View {
                 }
             case .paged(let source):
                 PagedPreview(source: source).id(source.id)
+            case .markdown(let source):
+                if source.isEmpty {
+                    Text("空文件").foregroundStyle(.secondary)
+                } else {
+                    MarkdownPreview(entry: entry, source: source).id(entry.id)
+                }
             case .workbook(let workbook):
                 XLSXPreview(workbook: workbook).id(workbook.id)
             case .workbookError(let message):
@@ -142,6 +152,12 @@ struct FilePreview: View {
             case .pdf(let pdf):
                 PDFPreview(document: pdf.document)
                     .accessibilityLabel("PDF 预览")
+            case .word(let word):
+                WordPreview(document: word.content)
+                    .accessibilityLabel("Word 预览")
+            case .font(let specimen):
+                FontPreview(specimen: specimen)
+                    .accessibilityLabel("字体预览")
             case .media(let kind):
                 MediaPreview(entry: entry, kind: kind)
                     .id(entry.url)

@@ -44,7 +44,7 @@ private struct TransferPreparation: Sendable {
                 items.append(item)
             } else if let existing = FileStamp(target) {
                 conflicts.append(.init(item: item, occupant: logicalTarget, stamp: existing,
-                                       canReplace: incoming[key] == nil && item.stamp.regular && existing.regular && !existing.sameObject(as: stamp)))
+                                       canReplace: destination.supportsSwap && incoming[key] == nil && item.stamp.regular && existing.regular && !existing.sameObject(as: stamp)))
             } else if let earlier = incoming[key] {
                 conflicts.append(.init(item: item, occupant: earlier.url, stamp: earlier.stamp, canReplace: false))
             } else {
@@ -213,7 +213,7 @@ final class TransferQueue {
             written.insert(destination.key(outcome.url.lastPathComponent))
             if let warning = outcome.warning { job.warnings.append(warning) }
             if operation == .move, outcome.url.path != item.url.path {
-                job.moved.append(FileRelocation(original: item.url, current: outcome.url))
+                if !outcome.sourceRetained { job.moved.append(FileRelocation(original: item.url, current: outcome.url)) }
                 if let backup = outcome.replaced { job.backups.append(backup) }
             }
         } catch is CancellationError {

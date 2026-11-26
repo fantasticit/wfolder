@@ -112,8 +112,8 @@ struct PagedPreviewSource: PreviewGridSource {
         }
     }
 
-    func smallText() throws -> String? {
-        guard !mode.isTable, file.size <= 256 * 1024 else { return nil }
+    func smallText(maxBytes: UInt64 = 256 * 1024) throws -> String? {
+        guard !mode.isTable, file.size <= maxBytes else { return nil }
         let bytes = UInt64(sample.count) == file.size ? sample : try file.read(at: 0, count: Int(file.size))
         return encoding.decode(Data(bytes.dropFirst(Int(start))))
     }

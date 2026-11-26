@@ -18,10 +18,12 @@ extension FocusedValues {
 @main
 struct PerchFilesApp: App {
     @NSApplicationDelegateAdaptor(PerchDelegate.self) private var delegate
+    @Environment(\.openWindow) private var openWindow
 
     var body: some Scene {
         Window("wfolder", id: "browser") {
             BrowserView(directory: Self.startingDirectory, restoresSession: Self.startingDirectory == nil) {
+                delegate.showBrowserWindow = { openWindow(id: "browser") }
                 delegate.attachWorkspace($0)
             }
             .frame(minWidth: 920, minHeight: 510)
@@ -29,6 +31,20 @@ struct PerchFilesApp: App {
         .windowToolbarStyle(.unified)
         .defaultSize(width: 1_170, height: 720)
         .commands { BrowserCommands() }
+
+        Settings {
+            TabView {
+                BrowserGeneralSettings()
+                    .tabItem { Label("通用", systemImage: "gearshape") }
+                DefaultOpeningSettingsView()
+                    .tabItem { Label("默认打开", systemImage: "folder") }
+                AISettingsView()
+                    .tabItem { Label("AI 服务", systemImage: "sparkles") }
+                AIPermissionsView()
+                    .tabItem { Label("AI 权限", systemImage: "lock.shield") }
+            }
+            .fixedSize()
+        }
     }
 
     private static var startingDirectory: URL? {
@@ -43,6 +59,7 @@ struct PerchFilesApp: App {
 
 @MainActor
 final class PerchDelegate: NSObject, NSApplicationDelegate {
+    var showBrowserWindow: (() -> Void)?
     private weak var workspace: BrowserWorkspace?
     private var pendingFinderItems: [BrowserAddress] = []
 
@@ -52,6 +69,10 @@ final class PerchDelegate: NSObject, NSApplicationDelegate {
         let items = pendingFinderItems
         pendingFinderItems.removeAll()
         DispatchQueue.main.async { [weak self] in self?.openFinderItems(items) }
+    }
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        receiveExternalURLs(urls)
     }
 
     @objc(openInWfolder:userData:error:)
@@ -65,26 +86,28 @@ final class PerchDelegate: NSObject, NSApplicationDelegate {
             error?.pointee = "找不到 Finder 选中的文件或文件夹。"
             return
         }
-        let selectedURLs = urls
+        receiveExternalURLs(urls)
+    }
+
+    private func receiveExternalURLs(_ urls: [URL]) {
         Task {
             let items = await Task.detached(priority: .userInitiated) {
-                selectedURLs.compactMap { BrowserAddress.resolve(fileURL: $0, packagesAsFiles: true) }
+                urls.compactMap { BrowserAddress.resolve(fileURL: $0, packagesAsFiles: true) }
             }.value
             if !items.isEmpty { openFinderItems(items) }
         }
     }
 
     private func openFinderItems(_ items: [BrowserAddress]) {
-        guard let workspace else {
+        guard let workspace, let window = NSApp.windows.first(where: { $0.identifier?.rawValue == "browser" }) else {
             pendingFinderItems.append(contentsOf: items)
+            showBrowserWindow?()
             return
         }
         workspace.openFinderItems(items)
         NSApp.activate()
-        if let window = NSApp.windows.first(where: { $0.identifier?.rawValue == "browser" }) {
-            if window.isMiniaturized { window.deminiaturize(nil) }
-            window.makeKeyAndOrderFront(nil)
-        }
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        window.makeKeyAndOrderFront(nil)
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -148,6 +171,14 @@ private struct BrowserCommands: Commands {
             .keyboardShortcut(.delete, modifiers: .command)
             .disabled(browser?.selectedIDs.isEmpty != false || browser?.canModifyDirectory != true)
             Divider()
+            Button("复制到文件夹…") {
+                if let workspace, let browser { workspace.chooseTransferDestination(.copy, items: browser.selectedEntries, from: browser) }
+            }
+            .disabled(browser?.selectedIDs.isEmpty != false || browser?.busy == true)
+            Button("移动到文件夹…") {
+                if let workspace, let browser { workspace.chooseTransferDestination(.move, items: browser.selectedEntries, from: browser) }
+            }
+            .disabled(browser?.selectedIDs.isEmpty != false || browser?.busy == true)
             Button("复制到其他面板") { workspace?.requestTransfer(.copy) }
                 .keyboardShortcut("c", modifiers: [.command, .option])
                 .disabled(!canTransfer(.copy))
@@ -180,6 +211,9 @@ private struct BrowserCommands: Commands {
                 .disabled(workspace?.canUndoFileOperation != true)
         }
         CommandMenu("工作区") {
+            Button("AI 助手…") { workspace?.openAIAssistant() }
+                .keyboardShortcut("a", modifiers: [.command, .option])
+                .disabled(workspace == nil)
             Button("保存或打开工作区…") { workspace?.presentedTool = .workspaces }
                 .keyboardShortcut("s")
                 .disabled(workspace == nil)
@@ -194,12 +228,25 @@ private struct BrowserCommands: Commands {
             Button("对比面板目录…") { workspace?.presentedTool = .compare }
                 .disabled((workspace?.folderBrowsers.count ?? 0) < 2)
             Divider()
+            Button("命令面板…") { workspace?.presentedTool = .commands }
+                .keyboardShortcut("p", modifiers: [.command, .shift])
+                .disabled(workspace == nil)
+            Button("高级搜索…") { workspace?.presentedTool = .advancedSearch(nil) }
+                .keyboardShortcut("f", modifiers: [.command, .shift])
+                .disabled(workspace == nil)
+            Button("服务器与磁盘…") { workspace?.presentedTool = .remote }
+                .disabled(workspace == nil)
+            Button("整理规则…") { workspace?.presentedTool = .organization }
+                .disabled(workspace == nil)
             Button("Spotlight 搜索…") { workspace?.presentedTool = .spotlight }
                 .keyboardShortcut("f", modifiers: [.command, .option])
                 .disabled(workspace == nil)
         }
         CommandMenu("前往") {
-            Button("后退") { browser?.back() }
+            Button("后退") {
+                if let browser, browser.isArchivePane { workspace?.closeArchivePane(browser) }
+                else { browser?.back() }
+            }
                 .keyboardShortcut("[")
                 .disabled(browser?.zipArchive == nil && browser?.backStack.isEmpty != false)
             Button("前进") { browser?.forward() }
@@ -213,7 +260,7 @@ private struct BrowserCommands: Commands {
             Divider()
             Button("编辑地址") { workspace?.focusAddress() }
                 .keyboardShortcut("l")
-                .disabled(browser?.isStash != false)
+                .disabled(browser?.isVirtual != false)
             Button("前往路径…") { workspace?.presentedTool = .goToPath }
                 .keyboardShortcut("g", modifiers: [.command, .shift])
                 .disabled(workspace == nil)
@@ -237,6 +284,15 @@ private struct BrowserCommands: Commands {
             Button("切换到下一面板") { workspace?.switchPane() }
                 .keyboardShortcut("`", modifiers: [.command, .option])
                 .disabled((workspace?.activeTab.browsers.count ?? 0) < 2)
+            ForEach(PaneDirection.allCases) { direction in
+                Button("切换到\(direction.label)侧面板") { workspace?.switchPane(toward: direction) }
+                    .keyboardShortcut(direction.key, modifiers: [.control, .option])
+                    .disabled((workspace?.activeTab.browsers.count ?? 0) < 2)
+            }
+            Toggle("Windows 键位", isOn: Binding(
+                get: { workspace?.windowsKeyBindings ?? false },
+                set: { workspace?.windowsKeyBindings = $0 }
+            )).disabled(workspace == nil)
             Button("关闭当前面板") { workspace?.closePane() }
                 .keyboardShortcut("w", modifiers: [.command, .option])
                 .disabled(workspace?.canClosePane != true)
