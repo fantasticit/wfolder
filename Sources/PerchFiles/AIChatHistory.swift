@@ -32,9 +32,11 @@ struct AISearchSummary: Codable, Sendable {
     var title: String { count == 0 ? "没有匹配的文件" : "找到 \(count) 项匹配" }
 
     var details: [String] {
-        var lines = ["搜索目录  " + folder.root.path] + samples
+        var lines = ["搜索已完成（可访问范围）", "搜索目录  " + (folder.root.path == "/" ? "本机 /" : folder.root.path)]
+        lines += folder.conditions.aiDetails
+        lines += samples
         if count > samples.count { lines.append("还有 \(count - samples.count) 项可在结果面板查看。") }
-        if unreadable > 0 { lines.append("\(unreadable) 个子目录无法读取。") }
+        if unreadable > 0 { lines.append("\(unreadable) 个目录无法读取，结果仅包含可访问的文件。") }
         return lines
     }
 

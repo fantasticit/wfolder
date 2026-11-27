@@ -6,6 +6,7 @@ struct FolderTreeRow: View {
     let showHidden: Bool
     var usesAccent = true
     let navigate: (URL) -> Void
+    let workspace: BrowserWorkspace
 
     @ViewState private var expanded = false
     @ViewState private var children: [Place]?
@@ -31,7 +32,7 @@ struct FolderTreeRow: View {
                         .foregroundStyle(.secondary)
                 } else {
                     ForEach(children) { child in
-                        FolderTreeRow(place: child, model: model, showHidden: showHidden, navigate: navigate)
+                        FolderTreeRow(place: child, model: model, showHidden: showHidden, navigate: navigate, workspace: workspace)
                     }
                 }
             } else {
@@ -47,6 +48,8 @@ struct FolderTreeRow: View {
             }
             .buttonStyle(.plain)
             .help(place.url.path)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .modifier(DirectoryDrop(directory: place.url, workspace: workspace))
         }
         .tag(place.id)
         .task(id: LoadRequest(expanded: expanded, showHidden: showHidden,

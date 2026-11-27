@@ -271,7 +271,7 @@ struct AIClient: Sendable {
     answer: message in the user's language with a short answer or a clarification question
 
     location and destination are objects with "place" (current, home, desktop, documents, downloads, pictures,
-    applications, delivery), or "path" (literal user-supplied file path). Do not combine place and path.
+    applications, delivery, computer), or "path" (literal user-supplied file path). Do not combine place and path.
     When filters are present use fields "filename", "contents", "tag", "extensions" (array of strings, for
     example ["pdf","zip"]), "kind" (folder, image, video, audio, document, archive), "minimumMB" (number),
     "days" (integer, modified within N days), and "recursive" (boolean). Only use applicable fields.
@@ -287,6 +287,10 @@ struct AIClient: Sendable {
     {"action":"search","location":{"place":"downloads"},"filters":{"extensions":["pdf"],"days":7,"minimumMB":10}}
     Example for “搜一下 aigc 的架构文档”:
     {"action":"search","project":"aigc","name":"AIGC 架构文档","filters":{"kind":"document","concepts":[["架构","系统设计","技术方案","architecture","system design","technical design","tech design","design spec"]]}}
+    For an explicit whole-computer search, use location.place "computer", recursive true, and only
+    filters requested in the current message. Do not carry a previous project's topics or date filters.
+    Example for “帮我找下本机所有的图片”:
+    {"action":"search","location":{"place":"computer"},"filters":{"kind":"image","recursive":true}}
     Example for “查一下架构设计文档”:
     {"action":"search","filters":{"kind":"document","concepts":[["架构","系统设计","architecture","technical design","tech design"]]}}
     Example for “把选中的文件移到文稿”:

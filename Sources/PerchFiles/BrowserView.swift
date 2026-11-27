@@ -231,7 +231,7 @@ struct BrowserView: View {
             Section {
                 ForEach(shortcuts) { place in
                     FolderTreeRow(place: place, model: directoryModel, showHidden: showHidden,
-                                  usesAccent: place.url != BrowserModel.home, navigate: workspace.navigateToFolder)
+                                  usesAccent: place.url != BrowserModel.home, navigate: workspace.navigateToFolder, workspace: workspace)
                 }
             } header: {
                 Text("常用位置").background(OverlayScrollIndicators())
@@ -263,7 +263,7 @@ struct BrowserView: View {
                     ForEach(favorites) { place in
                         FolderTreeRow(place: place, model: directoryModel, showHidden: showHidden,
                                       usesAccent: place.url != BrowserModel.home && place.url != disk.url,
-                                      navigate: workspace.navigateToFolder)
+                                      navigate: workspace.navigateToFolder, workspace: workspace)
                             .contextMenu { Button("取消收藏") { model.toggleFavorite(place.url) } }
                     }
                 }
@@ -277,6 +277,7 @@ struct BrowserView: View {
                         }
                         .buttonStyle(.plain)
                         .help(volume.url.path)
+                        .modifier(DirectoryDrop(directory: volume.url, workspace: workspace))
                         .contextMenu {
                             Button("打开", systemImage: "folder") { workspace.openLocationPane(volume.url, mounted: true) }
                             Button("复制路径", systemImage: "link") { model.copyPath(volume.url) }
@@ -329,7 +330,7 @@ struct BrowserView: View {
             if !model.isFavorite(disk.url) {
                 Section("位置") {
                     FolderTreeRow(place: disk, model: directoryModel, showHidden: showHidden,
-                                  usesAccent: false, navigate: workspace.navigateToFolder)
+                                  usesAccent: false, navigate: workspace.navigateToFolder, workspace: workspace)
                 }
             }
             Section {
@@ -736,6 +737,7 @@ private struct BrowserPane: View {
         .safeAreaInset(edge: .top, spacing: 0) {
             VStack(spacing: 0) {
                 if showsHeader || model.isVirtual { paneHeader }
+                if let folder = model.smartFolder { smartSearchInfo(folder) }
                 if !model.isVirtual {
                     BrowserNavigation(workspace: workspace, model: model, isActive: isActive,
                                       focusFileList: focusFileList)
@@ -784,6 +786,28 @@ private struct BrowserPane: View {
         }
         .buttonStyle(.plain)
         .accessibilityAddTraits(isActive ? .isSelected : [])
+        .background(.bar)
+    }
+
+    private func smartSearchInfo(_ folder: SmartFolder) -> some View {
+        let state = model.smartSearchStopped ? "已停止，结果不完整"
+            : model.loadError != nil ? "搜索未完成"
+            : model.smartSearchScanned != nil || model.loading ? "正在搜索，结果持续更新"
+            : "搜索已完成（可访问范围）"
+        return VStack(alignment: .leading, spacing: 4) {
+            Text("范围  " + (folder.root.path == "/" ? "本机 /" : folder.root.path))
+                .lineLimit(1).truncationMode(.middle).help(folder.root.path)
+            Text(folder.conditions.aiDetails.joined(separator: " · "))
+                .lineLimit(2).help(folder.conditions.aiDetails.joined(separator: "\n"))
+            Text(state + " · \(model.entries.count) 项匹配")
+            if let notice = model.searchNotice { Text(notice) }
+            Divider()
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 12)
+        .padding(.top, 6)
         .background(.bar)
     }
 

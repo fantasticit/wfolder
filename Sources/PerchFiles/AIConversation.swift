@@ -81,6 +81,12 @@ final class AIConversation {
         request = Task { [weak self, weak workspace] in
             guard let self, let workspace else { return }
             do {
+                if let intent = AIIntent.directSearch(for: prompt) {
+                    history.append(AIExchange(user: prompt, assistant: #"{"action":"search","location":{"place":"computer"},"filters":{"kind":"image"}}"#))
+                    history = Array(history.suffix(8))
+                    try await search(intent, in: workspace, context: context, turn: turn)
+                    return
+                }
                 let settings = AISettingsStore.shared
                 let provider = settings.provider
                 let connection = try settings.connection(provider: provider, profile: settings.profile(for: provider))
@@ -114,11 +120,11 @@ final class AIConversation {
                     }
                     return
                 }
-                guard context.matches(workspace) else { throw AIActionError.contextChanged }
                 if intent.action == .search {
                     try await search(intent, in: workspace, context: context, turn: turn)
                     return
                 }
+                guard context.matches(workspace) else { throw AIActionError.contextChanged }
                 let proposal = try await intent.proposal(in: workspace, context: context)
                 try Task.checkCancellation()
                 guard context.matches(workspace) else { throw AIActionError.contextChanged }
@@ -252,7 +258,7 @@ final class AIConversation {
         partialText = ""
         scrollRevision += 1
         let folder = try await intent.searchFolder(in: workspace, context: context, prompt: turn.prompt)
-        guard context.matches(workspace) else { throw AIActionError.contextChanged }
+        try Task.checkCancellation()
         let summary = try await searchSummary(folder, in: workspace)
         finishSearch(turn.id, summary: summary)
     }
@@ -286,7 +292,12 @@ final class AIConversation {
     private func searchSummary(_ folder: SmartFolder, in workspace: BrowserWorkspace) async throws -> AISearchSummary {
         let pane = workspace.openSmartFolder(folder)
         pane.start()
-        let results = try await pane.completedSmartSearch()
+        let results = try await withTaskCancellationHandler {
+            try await pane.completedSmartSearch()
+        } onCancel: {
+            Task { @MainActor in pane.stopSmartSearch() }
+        }
+        try Task.checkCancellation()
         return AISearchSummary(folder: folder, results: results)
     }
 

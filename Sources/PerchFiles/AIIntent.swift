@@ -8,7 +8,7 @@ struct AIIntent: Decodable, Sendable {
 
     struct Location: Decodable, Sendable {
         enum Place: String, Decodable, Sendable {
-            case current, home, desktop, documents, downloads, pictures, applications, delivery
+            case current, home, desktop, documents, downloads, pictures, applications, delivery, computer
         }
 
         let place: Place?
@@ -29,6 +29,7 @@ struct AIIntent: Decodable, Sendable {
             case .downloads: return "~/Downloads"
             case .pictures: return "~/Pictures"
             case .applications: return "/Applications"
+            case .computer: return "/"
             case .delivery:
                 guard let projectDelivery else { throw FileWorkflowError.missingDelivery }
                 return projectDelivery.path
@@ -144,7 +145,8 @@ struct AIIntent: Decodable, Sendable {
 
     @MainActor func searchFolder(in workspace: BrowserWorkspace, context: AIFolderContext,
                                 prompt: String? = nil) async throws -> SmartFolder {
-        var root = try await folder(for: location, in: context)
+        let computer = location?.place == .computer || Self.requestsComputerSearch(prompt)
+        var root = computer ? URL(fileURLWithPath: "/", isDirectory: true) : try await folder(for: location, in: context)
         var conditions = try filters?.conditions() ?? SearchConditions()
         var concepts = try filters?.searchConcepts() ?? []
         if concepts.isEmpty, conditions.contents.isEmpty, conditions.kind == nil || conditions.kind == .document,
@@ -153,16 +155,20 @@ struct AIIntent: Decodable, Sendable {
             conditions.kind = .document
             concepts = [aliases]
         }
+        if Self.isAllComputerImages(prompt) {
+            conditions = SearchConditions(kind: .image)
+            concepts = []
+        }
         var scopeID = context.workspaceID
         var scopeName = context.workspaceName
         let namedMemory = project.flatMap { workspace.aiMemory.project(named: $0) }
             ?? workspace.aiMemory.project(mentionedIn: prompt)
         let remembered = namedMemory ?? (project == nil ? workspace.activeProjectMemory : nil)
-        if location == nil, let remembered, let known = workspace.searchRoot(for: remembered) {
+        if !computer, location == nil, let remembered, let known = workspace.searchRoot(for: remembered) {
             root = try await folder(for: Location(place: nil, path: known.path), in: context)
             scopeID = remembered.id
             scopeName = remembered.name
-        } else if let project {
+        } else if !computer, let project {
             let name = project.trimmingCharacters(in: .whitespacesAndNewlines)
             guard name.count <= 64, name.unicodeScalars.contains(where: CharacterSet.alphanumerics.contains),
                   (try? FileSystem.validateName(name)) != nil,
@@ -187,6 +193,29 @@ struct AIIntent: Decodable, Sendable {
         return SmartFolder(name: shortName ?? "AI 搜索", root: root, conditions: conditions,
                            semantics: concepts.isEmpty ? nil : SearchSemantics(concepts: concepts),
                            feedbackContext: feedback)
+    }
+
+    // An explicit fresh search must never be interpreted as replaying an earlier result.
+    static func directSearch(for prompt: String) -> AIIntent? {
+        guard isAllComputerImages(prompt) else { return nil }
+        let json = #"{"action":"search","name":"本机图片","location":{"place":"computer"},"filters":{"kind":"image","recursive":true}}"#
+        return try? JSONDecoder().decode(Self.self, from: Data(json.utf8))
+    }
+
+    static func isAllComputerImages(_ prompt: String?) -> Bool {
+        guard let prompt else { return false }
+        // Match only a complete, unqualified request. Dates, subjects and exclusions
+        // must still be interpreted by the model rather than silently discarded.
+        let chinese = #"^\s*(?:(?:请|麻烦|帮我|帮忙|我想要|我想|可以|能不能|能否|查找|搜索|搜|查|找|显示|列出|看|一下|下|在)\s*)*(?:本机|全盘|(?:整台|整个|这台|全部|全)电脑|所有磁盘)(?:里|中|上|内|的)*(?:所有|全部)的?(?:图片|图像|照片)(?:文件)?[。.!！?？\s]*$"#
+        let english = #"^\s*(?:please\s+)?(?:find|search(?:\s+for)?|show|list)(?:\s+me)?\s+all\s+(?:images|pictures|photos)\s+(?:on|in)\s+(?:this computer|the entire computer|all (?:local )?(?:disks|drives))[.!?\s]*$"#
+        return prompt.range(of: chinese, options: .regularExpression) != nil ||
+            prompt.range(of: english, options: [.regularExpression, .caseInsensitive]) != nil
+    }
+
+    static func requestsComputerSearch(_ prompt: String?) -> Bool {
+        guard let prompt else { return false }
+        return prompt.range(of: #"本机(?:里|中|上|内|的|所有|全部)|全(?:部)?电脑|整(?:台电脑|个电脑)|全盘|所有磁盘|(?i:\b(?:this computer|entire (?:computer|machine)|all (?:local )?(?:disks|drives))\b)"#,
+                            options: .regularExpression) != nil
     }
 
     @MainActor func proposal(in workspace: BrowserWorkspace, context: AIFolderContext) async throws -> AIProposal {
@@ -426,7 +455,7 @@ enum AIActionError: LocalizedError {
     }
 }
 
-private extension SearchConditions {
+extension SearchConditions {
     var aiDetails: [String] {
         var details: [String] = []
         if !filename.isEmpty { details.append("文件名含「\(filename)」") }

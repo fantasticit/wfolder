@@ -378,6 +378,9 @@ final class BrowserModel {
 
     func updateSmartFolder(_ folder: SmartFolder) {
         guard smartFolder != folder else { return }
+        smartTask?.cancel()
+        smartTask = nil
+        smartSearchRevision += 1
         smartFolder = folder
         entries = []
         applyListing(FileListing(entries: []))
@@ -389,6 +392,8 @@ final class BrowserModel {
     }
 
     private func refreshSmartFolder(_ folder: SmartFolder) {
+        // Focus changes and file watchers must not replace an in-flight read-only search.
+        guard smartTask == nil else { return }
         smartTask?.cancel()
         smartSearchRevision += 1
         let request = smartSearchRevision
@@ -405,7 +410,7 @@ final class BrowserModel {
                     Task { @MainActor [weak self] in
                         guard let self, self.smartSearchRevision == request, let scanned = self.smartSearchScanned else { return }
                         self.smartSearchScanned = max(scanned, progress.scanned)
-                        if self.entries.isEmpty, let firstMatches = progress.firstMatches {
+                        if let firstMatches = progress.firstMatches {
                             self.applySmartSearchEntries(firstMatches)
                             self.loading = false
                         }
