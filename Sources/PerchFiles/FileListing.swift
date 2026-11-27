@@ -4,9 +4,11 @@ struct FileListing: Sendable {
     let id = UUID()
     let entries: [FileEntry]
     let rows: [URL: Int]
+    let contentMatches: [URL: [ContentIndex.Match]]
 
-    init(entries: [FileEntry]) {
+    init(entries: [FileEntry], contentMatches: [URL: [ContentIndex.Match]] = [:]) {
         self.entries = entries
+        self.contentMatches = contentMatches
         rows = Dictionary(entries.enumerated().map { ($0.element.id, $0.offset) },
                           uniquingKeysWith: { first, _ in first })
     }
@@ -22,6 +24,12 @@ struct FileListing: Sendable {
     static func matches(name: String, filename: String, query: String) -> Bool {
         name.localizedStandardContains(query) || (filename != name && filename.localizedStandardContains(query))
     }
+}
+
+enum FileSearchMode: String, CaseIterable, Identifiable, Sendable {
+    case name = "文件名"
+    case content = "文件内容"
+    var id: Self { self }
 }
 
 enum FolderSearchScope: String, CaseIterable, Identifiable, Sendable {
@@ -62,6 +70,8 @@ struct QuickSearchFilters: Equatable, Sendable {
 struct FolderSearchResults: Sendable {
     let entries: [FileEntry]
     let unreadable: Int
+    var contentMatches: [URL: [ContentIndex.Match]] = [:]
+    var reachedLimit = false
 }
 
 struct FolderSearchProgress: Sendable {

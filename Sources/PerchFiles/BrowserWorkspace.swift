@@ -20,6 +20,7 @@ final class BrowserSession {
     var isTransferring = false
     var localMutationCount = 0
     let history: FileHistory
+    let contentIndexStorage: ProfessionalStorage
     let frequentFiles: FrequentFiles
     @ObservationIgnored var enqueuePaste: ((PasteRequest, URL) -> Bool)?
     @ObservationIgnored var mutationFinished: (() -> Void)?
@@ -34,7 +35,9 @@ final class BrowserSession {
     private let storage: WorkspaceStorage
     private(set) var stash: [URL]
 
-    init(clipboard: NSPasteboard? = nil, defaults: UserDefaults = .standard) {
+    init(clipboard: NSPasteboard? = nil, defaults: UserDefaults = .standard,
+         contentIndexStorage: ProfessionalStorage = ProfessionalStorage()) {
+        self.contentIndexStorage = contentIndexStorage
         self.clipboard = clipboard ?? .general
         storage = WorkspaceStorage(defaults: defaults)
         aiMemory = defaults === UserDefaults.standard ? .shared : AIMemory(defaults: defaults)
@@ -245,7 +248,20 @@ final class BrowserWorkspace {
     private(set) var activeIndex = 0
     private(set) var addressFocusRequest = 0
     private(set) var paneFocusRequest = 0
+    struct DropResult: Identifiable {
+        let id: UUID
+        let historyID: UUID?
+        let target: URL
+        let files: [URL]
+        let message: String
+        let needsReview: Bool
+        var undoNote: String?
+    }
+
+    private(set) var dropResult: DropResult?
+
     let transfers = TransferQueue()
+    let professional: ProfessionalTools
     var transferChoice: TransferChoice?
     var destinationRequest: TransferDestinationRequest?
     var workflowRequest: FileWorkflowRequest?
@@ -260,11 +276,12 @@ final class BrowserWorkspace {
     var quickAccessPins: [QuickAccessPin] { session.pins }
 
     init(directory: URL, clipboard: NSPasteboard? = nil, restoreSession: Bool = false,
-         defaults: UserDefaults = .standard) {
-        let session = BrowserSession(clipboard: clipboard, defaults: defaults)
+         defaults: UserDefaults = .standard, professionalStorage: ProfessionalStorage = ProfessionalStorage()) {
+        let session = BrowserSession(clipboard: clipboard, defaults: defaults, contentIndexStorage: professionalStorage)
         let storage = WorkspaceStorage(defaults: defaults)
         self.session = session
         self.storage = storage
+        professional = ProfessionalTools(storage: professionalStorage)
         namedWorkspaces = storage.named
         smartFolders = storage.smartFolders
         remoteLocations = storage.remoteLocations
@@ -615,6 +632,25 @@ final class BrowserWorkspace {
         }
     }
 
+    func grantContentSearchAccess() -> Bool {
+        professional.entitlement.refresh()
+        guard professional.entitlement.status.allowsTools else {
+            presentedTool = .professional(.search, [])
+            return false
+        }
+        return true
+    }
+
+    func openContentSearch(in folder: URL? = nil) {
+        guard grantContentSearchAccess() else { return }
+        if let folder { navigateToFolder(folder) }
+        else if let browser = directoryBrowser { activatePane(browser) }
+        else { navigateToFolder(BrowserModel.home) }
+        showFolderBrowser()
+        activeBrowser.searchMode = .content
+        activeBrowser.beginFileSearch()
+    }
+
     func revealInFolder(_ url: URL) {
         navigateToFolder(url.deletingLastPathComponent())
         activeBrowser.revealItem(at: url)
@@ -709,6 +745,7 @@ final class BrowserWorkspace {
     @discardableResult
     func transfer(_ urls: [URL], into directory: URL, operation: PaneTransferOperation, fromStash: Bool = false,
                   preparedDestination: TransferFiles.Destination? = nil, expectedSources: [URL: FileStamp]? = nil,
+                  reportsDropResult: Bool = false,
                   onFinish: ((TransferJob) -> Void)? = nil) -> Bool {
         let sources = FileSystem.selectedRoots(urls.filter(\.isFileURL).map(\.standardizedFileURL))
         guard !sources.isEmpty, directory.isFileURL else { return false }
@@ -720,7 +757,9 @@ final class BrowserWorkspace {
         transfers.append(PaneTransfer(sources: sources, directory: directory.standardizedFileURL,
                                       operation: operation, fromStash: fromStash,
                                       preparedDestination: preparedDestination,
-                                      expectedSources: expectedSources), onFinish: onFinish)
+                                      expectedSources: expectedSources,
+                                      reportsDropResult: reportsDropResult), onFinish: onFinish)
+        if reportsDropResult { dropResult = nil }
         advanceTransfers()
         return true
     }
@@ -739,17 +778,63 @@ final class BrowserWorkspace {
             self.frequentFiles.relocate(job.backups, trashing: true)
             self.frequentFiles.relocate(relocations)
             let moving = job.request.operation == .move
-            self.history.record(moving ? .move : .copy, count: moving ? relocations.count : job.completed.count,
-                                detail: job.request.directory.path, relocations: relocations + job.backups)
+            let historyID = self.history.record(moving ? .move : .copy, count: moving ? relocations.count : job.completed.count,
+                                                detail: job.request.directory.path, relocations: relocations + job.backups)
+            if job.request.reportsDropResult { self.recordDropResult(job, historyID: historyID) }
             self.refreshLocations(job.request.sources, directories: [job.request.directory])
             self.session.isTransferring = false
             self.advanceTransfers()
         }
     }
 
-    var hasFileMutations: Bool { session.isTransferring || session.localMutationCount > 0 }
+    private func recordDropResult(_ job: TransferJob, historyID: UUID?) {
+        let files = job.request.sources.compactMap { job.published[$0] }
+        let moving = job.request.operation == .move
+        let finished = moving ? job.moved.count : files.count
+        var summary = [finished == 0 ? "未\(job.request.operation.title)文件" : "已\(job.request.operation.title) \(finished) 项"]
+        if moving, files.count > finished {
+            summary.append("\(files.count - finished) 项已复制，源文件仍保留")
+        }
+        if job.state == .cancelled { summary.append("剩余任务已取消") }
+        if job.skipped > 0 { summary.append("跳过 \(job.skipped) 项") }
+        if !job.failures.isEmpty { summary.append("\(job.failures.count) 项失败") }
+        if !job.warnings.isEmpty { summary.append("有项目需检查") }
+        dropResult = DropResult(id: job.id, historyID: historyID, target: job.request.directory, files: files,
+                                message: summary.joined(separator: " · "),
+                                needsReview: !job.failures.isEmpty || !job.warnings.isEmpty)
+    }
+
+    func dismissDropResult() { dropResult = nil }
+
+    func revealDropResult(_ result: DropResult) {
+        guard !result.files.isEmpty else { return }
+        let target = FileSystem.locationKey(result.target)
+        if let browser = folderBrowsers.first(where: { FileSystem.locationKey($0.directory) == target }) {
+            activatePane(browser)
+            browser.revealTransferredItems(result.files)
+        } else {
+            navigateToFolder(result.target)
+            directoryBrowser?.revealTransferredItems(result.files)
+        }
+    }
+
+    func canUndoDropResult(_ result: DropResult) -> Bool {
+        guard let historyID = result.historyID else { return false }
+        return canUndoFileOperation && history.latestUndo?.id == historyID
+    }
+
+    func undoDropResult(_ result: DropResult) {
+        guard canUndoDropResult(result) else { return }
+        undoFileOperation()
+    }
+
+    var hasFileMutations: Bool {
+        session.isTransferring || session.localMutationCount > 0 ||
+            professional.transfers.active != nil || professional.history.isBuilding
+    }
 
     func cancelTransfersForQuit() {
+        professional.transfers.pause()
         for job in transfers.jobs.reversed() { transfers.cancel(job) }
     }
 
@@ -768,6 +853,9 @@ final class BrowserWorkspace {
         Task {
             let result = await Task.detached(priority: .userInitiated) { entry.undo() }.value
             history.didUndo(entry, result: result)
+            if dropResult?.historyID == entry.id {
+                dropResult?.undoNote = result.remaining.isEmpty ? "已撤销" : "未能全部撤销，请查看操作历史"
+            }
             frequentFiles.relocate(result.restored, restoring: true)
             let stashed = result.restored.filter(\.wasInStash)
             session.updateStash(adding: stashed.map(\.original), removing: stashed.map(\.current))

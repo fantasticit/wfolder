@@ -295,6 +295,23 @@ private struct BrowserCommands: Commands {
                 .keyboardShortcut("f", modifiers: [.command, .option])
                 .disabled(workspace == nil)
         }
+        CommandMenu("文件工具") {
+            Button("显示文件工具…") {
+                guard let workspace else { return }
+                workspace.presentedTool = .professional(nil, workspace.activeBrowser.selectedEntries.map(\.url))
+            }.disabled(workspace == nil)
+            Divider()
+            ForEach(ProfessionalPage.allCases) { page in
+                Button(page.action + "…") {
+                    guard let workspace else { return }
+                    if page == .search { workspace.openContentSearch() }
+                    else { workspace.presentedTool = .professional(page, workspace.activeBrowser.selectedEntries.map(\.url)) }
+                }
+                .disabled(workspace == nil)
+            }
+            Divider()
+            Link("查看版本更新…", destination: URL(string: "https://github.com/fantasticit/wfolder/releases")!)
+        }
         CommandMenu("前往") {
             Button("后退") {
                 if let browser, browser.isArchivePane { workspace?.closeArchivePane(browser) }

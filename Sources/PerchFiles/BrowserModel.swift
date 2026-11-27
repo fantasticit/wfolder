@@ -73,6 +73,7 @@ final class BrowserModel {
     private(set) var entries: [FileEntry] = []
     private(set) var contentsID = UUID()
     private(set) var listing = FileListing(entries: [])
+    @ObservationIgnored private var folderListing = FileListing(entries: [])
     @ObservationIgnored private var unrankedListing = FileListing(entries: [])
     private(set) var loading = true
     private(set) var loadError: String?
@@ -85,8 +86,11 @@ final class BrowserModel {
     var query = "" {
         didSet {
             guard query != oldValue else { return }
-            updateSearch(reset: true, debounce: true)
+            updateSearch(reset: oldValue.isEmpty, debounce: true)
         }
+    }
+    var searchMode: FileSearchMode = .name {
+        didSet { if searchMode != oldValue { updateSearch(reset: true) } }
     }
     var searchScope: FolderSearchScope = .current {
         didSet {
@@ -98,10 +102,19 @@ final class BrowserModel {
     }
     private(set) var searchingDescendants = false
     private(set) var searchNotice: String?
-    var presentsSearch = false
+    private(set) var presentsSearch = false
+    private(set) var fileSearchFocusRequest = 0
+
+    func beginFileSearch() {
+        presentsSearch = true
+        fileSearchFocusRequest += 1
+    }
+
+    func dismissFileSearch() { clearSearch() }
     var issue: BrowserIssue?
     var prompt: FilePrompt?
     var expandedPreview: FileEntry?
+    private(set) var selectedContentPage: Int?
     var archivePreview: FileEntry?
     private(set) var zipArchive: FileEntry?
     @ObservationIgnored private var unrecordedArchive: URL?
@@ -128,6 +141,14 @@ final class BrowserModel {
     @ObservationIgnored private var searchTask: Task<(FolderSearchResults, FileListing), Error>?
     @ObservationIgnored private var searchRevision = 0
     @ObservationIgnored private var completedSearch: FolderSearchResults?
+    @ObservationIgnored private var indexedScope: ContentScope?
+    private let contentIndexStorage: ProfessionalStorage
+
+    private struct ContentScope: Equatable {
+        let roots: [URL]
+        let scope: FolderSearchScope
+        let showHidden: Bool
+    }
     @ObservationIgnored private var groupTask: Task<GroupedFileRows, Error>?
     @ObservationIgnored private var pendingReveal: Set<String> = []
     @ObservationIgnored private var explicitlyRevealedFiles: [URL] = []
@@ -148,6 +169,7 @@ final class BrowserModel {
     init(directory: URL, session: BrowserSession, isStash: Bool = false,
          smartFolder: SmartFolder? = nil, archive: FileEntry? = nil, mountedRoot: URL? = nil) {
         self.session = session
+        contentIndexStorage = session.contentIndexStorage
         self.isStash = isStash
         self.smartFolder = smartFolder
         self.isArchivePane = archive != nil
@@ -215,6 +237,28 @@ final class BrowserModel {
     var visibleEntries: [FileEntry] { listing.entries }
     var hasSearch: Bool { !query.isEmpty || quickSearchFilters.isActive }
     private var searchesDescendants: Bool { !isVirtual && hasSearch && searchScope != .current }
+    var searchesContent: Bool { !isVirtual && searchMode == .content && !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+
+    var selectedContentHits: [ContentIndex.Match] {
+        guard selectedIDs.count == 1, let id = selectedIDs.first else { return [] }
+        return listing.contentMatches[id] ?? []
+    }
+
+    var previewContentPage: Int? {
+        selectedContentPage ?? selectedContentHits.first(where: { $0.page > 0 })?.page
+    }
+
+    func previewSearchPage(_ page: Int) {
+        guard selectedContentHits.contains(where: { $0.page == page }) else { return }
+        selectedContentPage = page
+        showPreview = true
+    }
+
+    func refreshContentSearch() {
+        guard searchesContent else { return }
+        indexedScope = nil
+        updateSearch()
+    }
     var searchDirectories: [URL] {
         guard searchScope == .workspace, let roots = session.searchRoots?(id), !roots.isEmpty else { return [directory] }
         return roots
@@ -243,6 +287,8 @@ final class BrowserModel {
         let visible = ids.filter { listing.rows[$0] != nil }
         guard selectedIDs != visible else { return }
         selectedIDs = visible
+        selectedContentPage = nil
+        if !selectedContentHits.isEmpty { showPreview = true }
         if isStash, started { watchLocation() }
     }
 
@@ -282,8 +328,9 @@ final class BrowserModel {
 
     private func applyListing(_ next: FileListing) {
         unrankedListing = next
-        let ordered = ranked(next.entries).map(FileListing.init(entries:)) ?? next
-        guard listing.entries != ordered.entries else { return }
+        let ordered = ranked(next.entries).map { FileListing(entries: $0, contentMatches: next.contentMatches) } ?? next
+        guard listing.id != ordered.id else { return }
+        if let id = selectedIDs.first, listing.contentMatches[id] != ordered.contentMatches[id] { selectedContentPage = nil }
         listing = ordered
         select(selectedIDs)
         updateGroupedRows()
@@ -356,9 +403,11 @@ final class BrowserModel {
 
     private func arrive(at url: URL, revealing item: URL? = nil) {
         directory = url.standardizedFileURL
+        folderListing = FileListing(entries: [])
+        indexedScope = nil
         entries = []
         contentsID = UUID()
-        applyListing(FileListing(entries: []))
+        applyListing(folderListing)
         select([])
         restoreFolderView()
         pendingReveal = []
@@ -378,6 +427,9 @@ final class BrowserModel {
 
     func updateSmartFolder(_ folder: SmartFolder) {
         guard smartFolder != folder else { return }
+        smartTask?.cancel()
+        smartTask = nil
+        smartSearchRevision += 1
         smartFolder = folder
         entries = []
         applyListing(FileListing(entries: []))
@@ -389,6 +441,8 @@ final class BrowserModel {
     }
 
     private func refreshSmartFolder(_ folder: SmartFolder) {
+        // Focus changes and file watchers must not replace an in-flight read-only search.
+        guard smartTask == nil else { return }
         smartTask?.cancel()
         smartSearchRevision += 1
         let request = smartSearchRevision
@@ -405,7 +459,7 @@ final class BrowserModel {
                     Task { @MainActor [weak self] in
                         guard let self, self.smartSearchRevision == request, let scanned = self.smartSearchScanned else { return }
                         self.smartSearchScanned = max(scanned, progress.scanned)
-                        if self.entries.isEmpty, let firstMatches = progress.firstMatches {
+                        if let firstMatches = progress.firstMatches {
                             self.applySmartSearchEntries(firstMatches)
                             self.loading = false
                         }
@@ -502,6 +556,11 @@ final class BrowserModel {
         refresh(revealing: urls)
     }
 
+    func revealTransferredItems(_ urls: [URL]) {
+        clearSearch()
+        revealItems(inCurrentFolder: urls)
+    }
+
     private func clearSearch() {
         presentsSearch = false
         quickSearchFilters = .init()
@@ -522,8 +581,7 @@ final class BrowserModel {
         let explicitlyRevealedFiles = self.explicitlyRevealedFiles
         let sortColumn = self.sortColumn
         let ascending = self.ascending
-        let query = self.query
-        let filters = quickSearchFilters
+        let previous = folderListing
         loadTask?.cancel()
         if entries.isEmpty { loading = true }
         let task = Task.detached(priority: .userInitiated) {
@@ -550,7 +608,9 @@ final class BrowserModel {
             try Task.checkCancellation()
             let sorted = Self.sorted(files, by: sortColumn, ascending: ascending)
             try Task.checkCancellation()
-            return DirectoryContents(entries: sorted, visible: .matching(sorted, query: query, filters: filters))
+            if sorted == previous.entries { return DirectoryContents(entries: previous.entries, visible: previous) }
+            let listing = FileListing(entries: sorted)
+            return DirectoryContents(entries: sorted, visible: listing)
         }
         loadTask = task
         Task { [weak self] in
@@ -561,23 +621,21 @@ final class BrowserModel {
             switch result {
             case .success(let content):
                 self.loadError = nil
-                if self.entries != content.entries {
+                if self.folderListing.id != content.visible.id {
+                    self.folderListing = content.visible
                     self.entries = content.entries
                     self.contentsID = UUID()
+                    if !reuseSearch { self.indexedScope = nil }
                 }
-                if self.searchesDescendants {
-                    self.updateSearch(reuseResults: reuseSearch)
-                } else {
-                    self.applyListing(query == self.query && filters == self.quickSearchFilters ? content.visible :
-                        .matching(content.entries, query: self.query, filters: self.quickSearchFilters))
-                    self.revealPendingItems()
-                }
+                if self.searchTask != nil, self.searchesContent, !reuseSearch { break }
+                self.updateSearch(reuseResults: reuseSearch)
             case .failure(let error):
                 self.cancelSearch()
                 self.pendingReveal = []
                 self.entries = []
+                self.folderListing = FileListing(entries: [])
                 self.contentsID = UUID()
-                self.applyListing(FileListing(entries: []))
+                self.applyListing(self.folderListing)
                 self.select([])
                 self.loadError = error.localizedDescription
                 if self.searchScope == .workspace { self.refreshWorkspaceSearch() }
@@ -602,15 +660,16 @@ final class BrowserModel {
     }
 
     private func updateSearch(reset: Bool = false, debounce: Bool = false, reuseResults: Bool = false) {
-        guard searchesDescendants, loadError == nil || searchScope == .workspace else {
+        guard hasSearch, loadError == nil || searchScope == .workspace else {
             cancelSearch()
-            applyListing(.matching(entries, query: query, filters: quickSearchFilters))
+            if smartFolder != nil { applyListing(.matching(entries, query: query, filters: quickSearchFilters)) }
+            else { applyListing(folderListing) }
             revealPendingItems()
             return
         }
         if reset {
             searchNotice = nil
-            applyListing(.matching(entries, query: query, filters: quickSearchFilters))
+            applyListing(FileListing(entries: []))
         }
         if !reuseResults { completedSearch = nil }
         let cached = completedSearch
@@ -620,16 +679,35 @@ final class BrowserModel {
         let showHidden = session.showHidden
         let sortColumn = self.sortColumn
         let ascending = self.ascending
+        let base = entries
+        let descendants = searchesDescendants
+        let contentScope = searchesContent ? ContentScope(roots: directories, scope: searchScope, showHidden: showHidden) : nil
+        let indexNeedsRefresh = contentScope != indexedScope
+        let storage = contentIndexStorage
         searchRevision += 1
         let request = searchRevision
-        searchTask?.cancel()
+        let previousTask = searchTask
+        previousTask?.cancel()
         searchingDescendants = true
         let task = Task.detached(priority: .userInitiated) {
-            if debounce { try await Task.sleep(for: .milliseconds(180)) }
-            let results = try cached ?? Self.search(directories, query: query, showHidden: showHidden, filters: filters)
-            let sorted = Self.sorted(results.entries, by: sortColumn, ascending: ascending)
+            if debounce { try await Task.sleep(for: .milliseconds(contentScope == nil ? 150 : 350)) }
+            if contentScope != nil { _ = await previousTask?.result }
             try Task.checkCancellation()
-            return (results, FileListing(entries: sorted))
+            let matches: FolderSearchResults
+            if let cached { matches = cached }
+            else if let contentScope {
+                let search = FolderContentSearch(roots: contentScope.roots, scope: contentScope.scope,
+                                                 showHidden: contentScope.showHidden, storage: storage)
+                matches = try search.search(query, filters: filters, refreshIndex: indexNeedsRefresh)
+            } else if descendants {
+                matches = try Self.search(directories, query: query, showHidden: showHidden, filters: filters)
+            } else {
+                matches = FolderSearchResults(entries: FileListing.matching(base, query: query, filters: filters).entries,
+                                              unreadable: 0)
+            }
+            let sorted = Self.sorted(matches.entries, by: sortColumn, ascending: ascending)
+            try Task.checkCancellation()
+            return (matches, FileListing(entries: sorted, contentMatches: matches.contentMatches))
         }
         searchTask = task
         Task { [weak self] in
@@ -640,11 +718,17 @@ final class BrowserModel {
             switch result {
             case .success(let (matches, listing)):
                 self.completedSearch = matches
-                self.searchNotice = matches.unreadable == 0 ? nil : "\(matches.unreadable) 个子目录无法读取"
+                if let contentScope { self.indexedScope = contentScope }
+                var notices: [String] = []
+                if matches.unreadable > 0 {
+                    notices.append(contentScope == nil ? "\(matches.unreadable) 个子目录无法读取" : "\(matches.unreadable) 项未完整读取")
+                }
+                if matches.reachedLimit { notices.append("显示前 \(FolderContentSearch.matchLimit) 个命中片段") }
+                self.searchNotice = notices.isEmpty ? nil : notices.joined(separator: " · ")
                 self.applyListing(listing)
                 self.revealPendingItems()
             case .failure(let error):
-                self.searchNotice = "搜索中断：\(error.localizedDescription)"
+                self.searchNotice = "搜索未完成。\(error.localizedDescription)"
                 self.revealPendingItems()
             }
         }

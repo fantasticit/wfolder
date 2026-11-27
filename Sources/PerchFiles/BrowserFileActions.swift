@@ -26,7 +26,7 @@ struct BrowserFileActions {
                 return true
             }
             scroll.receive = { urls, directory, operation, fromStash in
-                workspace.transfer(urls, into: directory, operation: operation, fromStash: fromStash)
+                workspace.transfer(urls, into: directory, operation: operation, fromStash: fromStash, reportsDropResult: true)
             }
         }
     }
@@ -125,6 +125,26 @@ struct BrowserFileActions {
                                 enabled: !model.busy) {
                 workspace.chooseTransferDestination(operation, items: items, from: model)
             })
+        }
+        if !model.isArchivePane {
+            let urls = items.map(\.url)
+            menu.addItem(.separator())
+            menu.addItem(action("打包交付文件…", "shippingbox") { workspace.presentedTool = .professional(.delivery, urls) })
+            if items.allSatisfy({ !$0.isFolder }) {
+                menu.addItem(action("可暂停地复制…", "arrow.clockwise.circle") {
+                    workspace.presentedTool = .professional(.resume, urls)
+                })
+            }
+            if items.count == 2 && (items.allSatisfy(\.isFolder) || items.allSatisfy(VersionRaster.supports)) {
+                menu.addItem(action("比较这两项…", "square.split.2x1") {
+                    workspace.presentedTool = .professional(.compare, urls)
+                })
+            } else if entry?.isFolder == true {
+                menu.addItem(action("查找此文件夹里的文字…", "doc.text.magnifyingglass") {
+                    workspace.openContentSearch(in: entry?.url)
+                })
+            }
+            menu.addItem(.separator())
         }
         if let entry {
             menu.addItem(action("重命名…", "pencil", enabled: model.canRenameItems) { model.askRename(entry) })

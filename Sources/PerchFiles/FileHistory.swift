@@ -79,11 +79,14 @@ final class FileHistory {
         entries = defaults.data(forKey: key).flatMap { try? JSONDecoder().decode([FileHistoryEntry].self, from: $0) } ?? []
     }
 
-    func record(_ kind: FileHistoryEntry.Kind, count: Int, detail: String?, relocations: [FileRelocation]) {
-        guard count > 0 else { return }
-        entries.insert(FileHistoryEntry(date: Date(), kind: kind, count: count, detail: detail, remaining: relocations), at: 0)
+    @discardableResult
+    func record(_ kind: FileHistoryEntry.Kind, count: Int, detail: String?, relocations: [FileRelocation]) -> UUID? {
+        guard count > 0 else { return nil }
+        let entry = FileHistoryEntry(date: Date(), kind: kind, count: count, detail: detail, remaining: relocations)
+        entries.insert(entry, at: 0)
         if entries.count > 60 { entries.removeLast(entries.count - 60) }
         save()
+        return entry.id
     }
 
     func didUndo(_ entry: FileHistoryEntry, result: FileHistoryEntry.UndoResult) {

@@ -10,6 +10,17 @@ class OverlayScrollView: NSScrollView {
 
     required init?(coder: NSCoder) { nil }
 
+    func scrollToDocumentStart() {
+        tile()
+        let clip = contentView
+        let insets = clip.contentInsets
+        var start = clip.bounds
+        start.origin = NSPoint(x: -insets.left, y: -insets.top)
+        let origin = clip.constrainBoundsRect(start).origin
+        if clip.bounds.origin != origin { clip.scroll(to: origin) }
+        reflectScrolledClipView(clip)
+    }
+
     override var scrollerStyle: NSScroller.Style {
         get { super.scrollerStyle }
         set {

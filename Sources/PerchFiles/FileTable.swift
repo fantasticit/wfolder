@@ -92,7 +92,8 @@ struct FileTable: NSViewRepresentable {
         let checkboxesChanged = coordinator.showsCheckboxes != showsCheckboxes
         coordinator.showExtensions = settings.showExtensions
         coordinator.showsCheckboxes = showsCheckboxes
-        let rowHeight: CGFloat = showsLocation ? (settings.compactRows ? 36 : 42) : (settings.compactRows ? 22 : 29)
+        let rowHeight: CGFloat = !listing.contentMatches.isEmpty ? (settings.compactRows ? 49 : 56)
+            : showsLocation ? (settings.compactRows ? 36 : 42) : (settings.compactRows ? 22 : 29)
         if table.rowHeight != rowHeight { table.rowHeight = rowHeight }
         if locationChanged {
             coordinator.showsLocation = showsLocation
@@ -101,16 +102,23 @@ struct FileTable: NSViewRepresentable {
         if listingChanged || groupingChanged || locationChanged || extensionsChanged || checkboxesChanged {
             coordinator.listingID = listing.id
             coordinator.entries = listing.entries
+            coordinator.contentMatches = listing.contentMatches
             coordinator.groupedRows = groupedRows
             table.reloadData()
         }
-        if coordinator.needsScrollReset, directoryChanged || listingChanged || locationChanged {
-            // The fixed header overlaps the clip view, so zero is below the true scroll origin.
-            scroll.tile()
-            let clip = scroll.contentView
-            clip.scroll(to: NSPoint(x: -clip.contentInsets.left, y: -clip.contentInsets.top))
-            scroll.reflectScrolledClipView(clip)
+        if coordinator.needsScrollReset, directoryChanged || listingChanged || locationChanged,
+           let scroll = scroll as? FileDropScrollView {
+            scroll.scrollToDocumentStart()
             coordinator.needsScrollReset = listing.entries.isEmpty
+            if selection.isEmpty, !coordinator.needsScrollReset {
+                let request = listing.id
+                let origin = scroll.contentView.bounds.origin
+                DispatchQueue.main.async { [weak scroll, weak coordinator] in
+                    guard let scroll, let coordinator, coordinator.listingID == request,
+                          coordinator.model.selectedIDs.isEmpty, scroll.contentView.bounds.origin == origin else { return }
+                    scroll.scrollToDocumentStart()
+                }
+            }
         }
         if let column = table.tableColumns.first(where: { $0.identifier.rawValue == sortColumn.rawValue }),
            table.highlightedTableColumn != column
@@ -167,6 +175,7 @@ struct FileTable: NSViewRepresentable {
         let actions: BrowserFileActions
         var model: BrowserModel { actions.model }
         var entries: [FileEntry] = []
+        var contentMatches: [URL: [ContentIndex.Match]] = [:]
         var groupedRows: GroupedFileRows?
         var listingID: UUID?
         var directory: URL?
@@ -245,7 +254,8 @@ struct FileTable: NSViewRepresentable {
                   let field = FileColumn(rawValue: tableColumn.identifier.rawValue) else { return nil }
             let cell = tableView.makeView(withIdentifier: tableColumn.identifier, owner: nil) as? FileCell
                 ?? FileCell(field: field)
-            cell.configure(entry, showsLocation: showsLocation, showExtensions: showExtensions)
+            cell.configure(entry, showsLocation: showsLocation, showExtensions: showExtensions,
+                           hit: contentMatches[entry.id]?.first)
             if field == .name {
                 cell.configureCheckbox(visible: showsCheckboxes, name: entry.filename,
                                        selected: tableView.selectedRowIndexes.contains(row)) { [weak self, weak tableView] in
@@ -334,6 +344,7 @@ private final class FileCell: NSTableCellView {
     private let checkbox = FileSelectionCheckbox()
     private var checkboxWidth: NSLayoutConstraint?
     private var locationLabel: NSTextField?
+    private var excerptLabel: NSTextField?
     private var tint: NSColor = .secondaryLabelColor
 
     init(field: FileColumn) {
@@ -374,7 +385,13 @@ private final class FileCell: NSTableCellView {
             path.isHidden = true
             path.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
             label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-            let stack = NSStackView(views: [label, path])
+            let excerpt = NSTextField(labelWithString: "")
+            excerpt.font = .systemFont(ofSize: 11)
+            excerpt.lineBreakMode = .byTruncatingTail
+            excerpt.maximumNumberOfLines = 1
+            excerpt.isHidden = true
+            excerpt.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            let stack = NSStackView(views: [label, excerpt, path])
             stack.orientation = .vertical
             stack.alignment = .leading
             stack.spacing = 1
@@ -385,9 +402,11 @@ private final class FileCell: NSTableCellView {
                 stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
                 stack.centerYAnchor.constraint(equalTo: centerYAnchor),
                 label.widthAnchor.constraint(lessThanOrEqualTo: stack.widthAnchor),
+                excerpt.widthAnchor.constraint(lessThanOrEqualTo: stack.widthAnchor),
                 path.widthAnchor.constraint(lessThanOrEqualTo: stack.widthAnchor)
             ])
             locationLabel = path
+            excerptLabel = excerpt
             return
         } else {
             leading = leadingAnchor
@@ -420,9 +439,10 @@ private final class FileCell: NSTableCellView {
         label.textColor = selected ? .alternateSelectedControlTextColor : field == .name ? .labelColor : .secondaryLabelColor
         icon.contentTintColor = usesNativeIcon ? nil : selected ? .alternateSelectedControlTextColor : tint
         locationLabel?.textColor = selected ? .alternateSelectedControlTextColor : .secondaryLabelColor
+        excerptLabel?.textColor = selected ? .alternateSelectedControlTextColor : .labelColor
     }
 
-    func configure(_ entry: FileEntry, showsLocation: Bool, showExtensions: Bool) {
+    func configure(_ entry: FileEntry, showsLocation: Bool, showExtensions: Bool, hit: ContentIndex.Match?) {
         switch field {
         case .name:
             label.stringValue = entry.displayName(showExtensions: showExtensions)
@@ -445,7 +465,10 @@ private final class FileCell: NSTableCellView {
                 locationLabel.isHidden = !showsLocation
                 locationLabel.stringValue = showsLocation ? (path as NSString).abbreviatingWithTildeInPath : ""
             }
-            toolTip = showsLocation ? entry.filename + "\n" + path : entry.filename
+            let excerpt = hit.map { $0.label + " · " + $0.excerpt }
+            excerptLabel?.isHidden = excerpt == nil
+            excerptLabel?.stringValue = excerpt ?? ""
+            toolTip = ([entry.filename] + (showsLocation ? [path] : []) + (excerpt.map { [$0] } ?? [])).joined(separator: "\n")
             return
         case .kind:
             label.stringValue = entry.cloudStatus.map { entry.kind + " · " + $0.rawValue } ?? entry.kind

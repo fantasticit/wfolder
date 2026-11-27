@@ -122,10 +122,11 @@ enum FileSystem {
     }
 
     static func search(_ directory: URL, query: String, showHidden: Bool, recursive: Bool = true,
+                       includesPackageContents: Bool = false,
                        includesCandidate: (URL) -> Bool = { _ in true },
                        includesEntry: (FileEntry) -> Bool = { _ in true },
                        reportProgress: ((FolderSearchProgress) -> Void)? = nil) throws -> FolderSearchResults {
-        var options: FileManager.DirectoryEnumerationOptions = [.skipsPackageDescendants]
+        var options: FileManager.DirectoryEnumerationOptions = includesPackageContents ? [] : [.skipsPackageDescendants]
         if !showHidden { options.insert(.skipsHiddenFiles) }
         if !recursive { options.insert(.skipsSubdirectoryDescendants) }
         let location = DirectoryLocation(directory)
@@ -142,19 +143,26 @@ enum FileSystem {
                 }) else { throw CocoaError(.fileReadUnknown) }
         var matches: [FileEntry] = []
         var scanned = 0
-        var showedFirstMatches = false
-        let interval = Duration.milliseconds(180)
+        var publishedCount = 0
+        let interval = Duration.milliseconds(400)
         var nextUpdate = ContinuousClock.now + interval
         for case let url as URL in iterator {
             try Task.checkCancellation()
+            // The system data volume and boot volume alias the same user files.
+            // These runtime trees are available through their normal root paths.
+            if location.logicalURL(for: url).path == "/System/Volumes" ||
+                location.logicalURL(for: url).path == "/dev" {
+                iterator.skipDescendants()
+                continue
+            }
             scanned += 1
             if includesCandidate(url), searchNameMatches(url, query: query) {
                 let entry = FileEntry.read(url, presentedAs: location.logicalURL(for: url))
                 if includesEntry(entry) { matches.append(entry) }
             }
             if let reportProgress, scanned.isMultiple(of: 64), ContinuousClock.now >= nextUpdate {
-                let firstMatches = !showedFirstMatches && !matches.isEmpty ? Array(matches.prefix(32)) : nil
-                if firstMatches != nil { showedFirstMatches = true }
+                let firstMatches = matches.count > publishedCount ? matches : nil
+                publishedCount = matches.count
                 reportProgress(FolderSearchProgress(scanned: scanned, firstMatches: firstMatches))
                 nextUpdate = ContinuousClock.now + interval
             }

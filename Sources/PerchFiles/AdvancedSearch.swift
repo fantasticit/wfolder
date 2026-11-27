@@ -85,8 +85,18 @@ struct SmartFolder: Codable, Equatable, Identifiable, Sendable {
             let minimumBytes = conditions.minimumBytes
             let matchesConcepts = semantics?.matcher(in: root, readsContents: readsContents, indexed: semanticIndex)
             let since = Int(conditions.days).flatMap { Calendar.current.date(byAdding: .day, value: -$0, to: .now) }
-            return try FileSystem.search(root, query: conditions.filename, showHidden: showHidden,
-                                         recursive: conditions.recursive, includesCandidate: { url in
+            var imageSuffixes = [String: Bool]()
+            return try FileSystem.search(root, query: conditions.filename, showHidden: showHidden || root.path == "/",
+                                         recursive: conditions.recursive, includesPackageContents: root.path == "/",
+                                         includesCandidate: { url in
+                if conditions.kind == .image {
+                    let suffix = url.pathExtension.lowercased()
+                    if let image = imageSuffixes[suffix], !image { return false }
+                    if imageSuffixes[suffix] == nil, let type = UTType(filenameExtension: suffix) {
+                        imageSuffixes[suffix] = type.conforms(to: .image)
+                        if !type.conforms(to: .image) { return false }
+                    }
+                }
                 if let limitedTo, !limitedTo.contains(url.standardizedFileURL.path) { return false }
                 if !suffixes.isEmpty && !suffixes.contains(url.pathExtension.lowercased()) { return false }
                 if let since {
