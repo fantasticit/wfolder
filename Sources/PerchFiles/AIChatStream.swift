@@ -1,5 +1,24 @@
 import Foundation
 
+struct AIReplyText {
+    private static let outcomeLabels = ["verified local search outcome:", "confirmed local search outcome:",
+                                        "internal status of the latest local search (for planning only):"]
+    let body: String
+
+    init(_ text: String, streaming: Bool = false) {
+        var end = text.endIndex
+        text.enumerateSubstrings(in: text.startIndex..., options: .byLines) { line, range, _, stop in
+            let label = line?.trimmingCharacters(in: .whitespaces).lowercased() ?? ""
+            guard !label.isEmpty, Self.outcomeLabels.contains(where: {
+                label.hasPrefix($0) || (streaming && range.upperBound == text.endIndex && $0.hasPrefix(label))
+            }) else { return }
+            end = range.lowerBound
+            stop = true
+        }
+        body = text[..<end].trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
 struct AIChatStream {
     private struct Chunk: Decodable {
         struct Choice: Decodable {
@@ -31,9 +50,14 @@ struct AIChatStream {
     private var toolName = ""
     private let decoder = JSONDecoder()
 
-    var canShowText: Bool {
-        let prefix = text.prefix(16).trimmingCharacters(in: .whitespacesAndNewlines)
-        return !prefix.isEmpty && !prefix.hasPrefix("{") && !prefix.hasPrefix("```json")
+    var visibleText: String? {
+        let prefix = text.drop(while: \.isWhitespace).prefix(7).lowercased()
+        guard !prefix.isEmpty, !prefix.hasPrefix("{"), !"```json".hasPrefix(prefix) else { return nil }
+        if prefix.hasPrefix("```"), text.drop(while: \.isWhitespace).dropFirst(3).drop(while: \.isWhitespace).hasPrefix("{") {
+            return nil
+        }
+        let visible = AIReplyText(text, streaming: true).body
+        return visible.isEmpty ? nil : visible
     }
 
     mutating func consume(_ byte: UInt8) throws -> Bool {

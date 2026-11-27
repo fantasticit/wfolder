@@ -16,6 +16,16 @@ extension FocusedValues {
 }
 
 @main
+enum PerchFilesEntry {
+    @MainActor static func main() {
+        if CommandLine.arguments.dropFirst().first == "--mcp" {
+            AgentMCP.run()
+        } else {
+            PerchFilesApp.main()
+        }
+    }
+}
+
 struct PerchFilesApp: App {
     @NSApplicationDelegateAdaptor(PerchDelegate.self) private var delegate
     @Environment(\.openWindow) private var openWindow
@@ -42,6 +52,10 @@ struct PerchFilesApp: App {
                     .tabItem { Label("AI 服务", systemImage: "sparkles") }
                 AIPermissionsView()
                     .tabItem { Label("AI 权限", systemImage: "lock.shield") }
+                AIMemorySettingsView()
+                    .tabItem { Label("AI 记忆", systemImage: "brain") }
+                AgentConnectionsView()
+                    .tabItem { Label("Agent 连接", systemImage: "link") }
             }
             .fixedSize()
         }
@@ -65,6 +79,17 @@ final class PerchDelegate: NSObject, NSApplicationDelegate {
 
     func attachWorkspace(_ workspace: BrowserWorkspace) {
         self.workspace = workspace
+        AgentService.shared.bringForward = { [weak self] in
+            guard let self else { return }
+            NSApp.activate()
+            if let window = NSApp.windows.first(where: { $0.identifier?.rawValue == "browser" }) {
+                if window.isMiniaturized { window.deminiaturize(nil) }
+                window.makeKeyAndOrderFront(nil)
+            } else {
+                self.showBrowserWindow?()
+            }
+        }
+        AgentService.shared.attach(workspace)
         guard !pendingFinderItems.isEmpty else { return }
         let items = pendingFinderItems
         pendingFinderItems.removeAll()
@@ -73,6 +98,30 @@ final class PerchDelegate: NSObject, NSApplicationDelegate {
 
     func application(_ application: NSApplication, open urls: [URL]) {
         receiveExternalURLs(urls)
+    }
+
+    func application(_ sender: NSApplication, openFiles filenames: [String]) {
+        receiveExternalURLs(filenames.map { URL(fileURLWithPath: $0) })
+        sender.reply(toOpenOrPrint: .success)
+    }
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        NSAppleEventManager.shared().setEventHandler(self, andSelector: #selector(revealSelection(_:withReplyEvent:)),
+                                                     forEventClass: AEEventClass(kAEMiscStandards),
+                                                     andEventID: AEEventID(kAERevealSelection))
+    }
+
+    @objc private func revealSelection(_ event: NSAppleEventDescriptor, withReplyEvent reply: NSAppleEventDescriptor) {
+        guard let direct = event.paramDescriptor(forKeyword: AEKeyword(keyDirectObject)) else { return }
+        let values = direct.descriptorType == typeAEList ? (1...max(1, direct.numberOfItems)).compactMap {
+            direct.atIndex($0)
+        } : [direct]
+        let urls = values.compactMap { item -> URL? in
+            guard let string = item.coerce(toDescriptorType: typeFileURL)?.stringValue,
+                  let url = URL(string: string), url.isFileURL else { return nil }
+            return url
+        }
+        receiveExternalURLs(urls, revealing: true)
     }
 
     @objc(openInWfolder:userData:error:)
@@ -89,10 +138,13 @@ final class PerchDelegate: NSObject, NSApplicationDelegate {
         receiveExternalURLs(urls)
     }
 
-    private func receiveExternalURLs(_ urls: [URL]) {
+    private func receiveExternalURLs(_ urls: [URL], revealing: Bool = false) {
         Task {
             let items = await Task.detached(priority: .userInitiated) {
-                urls.compactMap { BrowserAddress.resolve(fileURL: $0, packagesAsFiles: true) }
+                urls.compactMap { url -> BrowserAddress? in
+                    guard let address = BrowserAddress.resolve(fileURL: url, packagesAsFiles: true) else { return nil }
+                    return revealing ? .file(url.standardizedFileURL) : address
+                }
             }.value
             if !items.isEmpty { openFinderItems(items) }
         }
@@ -203,6 +255,7 @@ private struct BrowserCommands: Commands {
         }
         CommandMenu("文件操作") {
             Button("传输队列…") { workspace?.revealOperations(.transfers) }
+            Button("Agent 任务…") { AgentService.shared.present() }.disabled(workspace == nil)
                 .disabled(workspace == nil)
             Button("操作历史…") { workspace?.revealOperations(.history) }
                 .disabled(workspace == nil)

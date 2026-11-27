@@ -48,8 +48,26 @@ enum DefaultOpening {
 
     static var applicationURL: URL? {
         let bundle = Bundle.main
-        guard bundle.bundleIdentifier != nil, bundle.bundleURL.pathExtension == "app" else { return nil }
-        return bundle.bundleURL
+        guard let identifier = bundle.bundleIdentifier, bundle.bundleURL.pathExtension == "app" else { return nil }
+        return resolveApplication(bundle.bundleURL, identifier: identifier)
+    }
+
+    static func resolveApplication(_ original: URL, identifier: String?) -> URL? {
+        let original = original.resolvingSymlinksInPath()
+        if validApplication(original, identifier: identifier) { return original }
+        guard let identifier else { return nil }
+        let applications = [URL(fileURLWithPath: "/Applications", isDirectory: true),
+                            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications", isDirectory: true)]
+        let candidates = applications.map { $0.appendingPathComponent(original.lastPathComponent) } +
+            [NSWorkspace.shared.urlForApplication(withBundleIdentifier: identifier)].compactMap { $0 }
+        return candidates.map { $0.resolvingSymlinksInPath() }.first { validApplication($0, identifier: identifier) }
+    }
+
+    private static func validApplication(_ url: URL, identifier: String?) -> Bool {
+        guard url.isFileURL, url.pathExtension == "app", let bundle = Bundle(url: url),
+              let executable = bundle.executableURL,
+              FileManager.default.isExecutableFile(atPath: executable.path) else { return false }
+        return identifier == nil || bundle.bundleIdentifier == identifier
     }
 
     static let documentTypes: [UTType] = {
@@ -102,25 +120,25 @@ enum DefaultOpening {
 
     @discardableResult
     static func set(_ application: Application, for type: UTType) async throws -> Bool {
+        guard let appURL = resolveApplication(application.url, identifier: application.bundleID) else {
+            throw ChangeError.missingApplication
+        }
+        if application.isWfolder { try checkLocation(appURL) }
+        let registration = LSRegisterURL(appURL as CFURL, true)
+        guard registration == noErr else { throw ChangeError.associationStatus(registration) }
         let before = current(for: type)
         guard before?.id != application.id else { return false }
-        if application.isWfolder { try checkLocation(application.url) }
         let workspace = NSWorkspace.shared
-        let appURL = application.url.resolvingSymlinksInPath()
         if type == .folder {
-            // Resolve a real directory's content type through Launch Services.
-            // This sets the type association for folders, not a per-item override.
-            let registration = LSRegisterURL(appURL as CFURL, true)
-            guard registration == noErr else { throw ChangeError.associationStatus(registration) }
-            let probe = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-            try FileManager.default.createDirectory(at: probe, withIntermediateDirectories: false)
-            defer { try? FileManager.default.removeItem(at: probe) }
             do {
-                try await workspace.setDefaultApplication(at: appURL, toOpenContentTypeOfFileAt: probe)
+                try await workspace.setDefaultApplication(at: appURL, toOpen: UTType.folder)
             } catch {
                 if wasCancelled(error) { throw CancellationError() }
                 let failure = error as NSError
                 let detail = failure.userInfo[NSUnderlyingErrorKey] as? NSError ?? failure
+                if detail.domain == NSOSStatusErrorDomain, [Int(kLSUnknownTypeErr), -50].contains(detail.code) {
+                    throw ChangeError.folderUnsupported
+                }
                 throw ChangeError.folderFailed(detail.domain, detail.code)
             }
         } else {
@@ -168,10 +186,13 @@ enum DefaultOpening {
     }
 
     private enum ChangeError: LocalizedError {
-        case associationStatus(OSStatus), folderFailed(String, Int), location, pending
+        case associationStatus(OSStatus), folderFailed(String, Int), location, pending, missingApplication, folderUnsupported
 
         var errorDescription: String? {
             switch self {
+            case .folderUnsupported:
+                return "当前 macOS 拒绝修改文件夹的默认应用。可选取文件夹在 wfolder 中打开，或使用访达右键「服务 → 在 wfolder 中打开」。"
+            case .missingApplication: return "找不到所选应用。请从「应用程序」重新打开 wfolder，或重新选取应用。"
             case .associationStatus(let status): return "macOS 未能更新默认应用（\(status)）。"
             case .folderFailed(let domain, let code): return "macOS 未能更新文件夹关联（\(domain) \(code)）。"
             case .location: return "请将 wfolder.app 拖到「应用程序」，从那里重新打开后再设置。"

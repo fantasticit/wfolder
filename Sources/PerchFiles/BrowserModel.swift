@@ -73,6 +73,7 @@ final class BrowserModel {
     private(set) var entries: [FileEntry] = []
     private(set) var contentsID = UUID()
     private(set) var listing = FileListing(entries: [])
+    @ObservationIgnored private var unrankedListing = FileListing(entries: [])
     private(set) var loading = true
     private(set) var loadError: String?
     private(set) var busy = false
@@ -264,9 +265,26 @@ final class BrowserModel {
         return knownSizes == selectedIDs.count ? "\(count) · \(formatted)" : "\(count) · 文件合计 \(formatted)"
     }
 
+    var searchFeedbackContext: SearchMemoryContext? {
+        if let smartFolder { return smartFolder.feedbackContext }
+        guard !isVirtual, !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        let workspace = session.workspaceIdentity?(id)
+        return SearchMemoryContext(query: query, root: directory, workspaceID: workspace?.0,
+                                   workspaceName: workspace?.1, source: .files)
+    }
+
+    func rerankSearch() { applyListing(unrankedListing) }
+
+    private func ranked(_ entries: [FileEntry]) -> [FileEntry]? {
+        guard !session.aiMemory.feedback.isEmpty, let context = searchFeedbackContext else { return nil }
+        return session.aiMemory.rank(entries, in: context)
+    }
+
     private func applyListing(_ next: FileListing) {
-        guard listing.entries != next.entries else { return }
-        listing = next
+        unrankedListing = next
+        let ordered = ranked(next.entries).map(FileListing.init(entries:)) ?? next
+        guard listing.entries != ordered.entries else { return }
+        listing = ordered
         select(selectedIDs)
         updateGroupedRows()
     }
@@ -432,7 +450,7 @@ final class BrowserModel {
         if smartSearchStopped { throw CancellationError() }
         guard revision == smartSearchRevision else { throw AIActionError.contextChanged }
         if let loadError { throw SearchFailure(message: loadError) }
-        return FolderSearchResults(entries: entries, unreadable: smartSearchUnreadable)
+        return FolderSearchResults(entries: ranked(entries) ?? entries, unreadable: smartSearchUnreadable)
     }
 
     func stopSmartSearch() {

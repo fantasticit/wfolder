@@ -3,18 +3,18 @@ import SwiftUI
 struct AIIntent: Decodable, Sendable {
     enum Action: String, Decodable, Sendable {
         case search, navigate, split, switchPane, view, preview, stash, copy, move
-        case compare, organize, workspace, queue, history, searchResults, answer
+        case compare, organize, workspace, queue, history, searchResults, workflow, answer
     }
 
     struct Location: Decodable, Sendable {
         enum Place: String, Decodable, Sendable {
-            case current, home, desktop, documents, downloads, pictures, applications
+            case current, home, desktop, documents, downloads, pictures, applications, delivery
         }
 
         let place: Place?
         let path: String?
 
-        func input(relativeTo root: URL) throws -> String {
+        func input(relativeTo root: URL, projectDelivery: URL? = nil) throws -> String {
             if let path {
                 guard place == nil, !path.isEmpty, path.utf8.count <= 4096, !path.utf8.contains(0),
                       !path.contains("://") || path.hasPrefix("file://") else { throw AIActionError.invalidParameters }
@@ -29,6 +29,9 @@ struct AIIntent: Decodable, Sendable {
             case .downloads: return "~/Downloads"
             case .pictures: return "~/Pictures"
             case .applications: return "/Applications"
+            case .delivery:
+                guard let projectDelivery else { throw FileWorkflowError.missingDelivery }
+                return projectDelivery.path
             }
         }
     }
@@ -102,6 +105,7 @@ struct AIIntent: Decodable, Sendable {
 
     enum Rename: String, Decodable, Sendable { case date, prefix }
     enum Grouping: String, Decodable, Sendable { case kind }
+    enum WorkflowTransfer: String, Decodable, Sendable { case copy, move }
 
     let action: Action
     let location: Location?
@@ -117,11 +121,13 @@ struct AIIntent: Decodable, Sendable {
     let previewOnly: Bool?
     let prefix: String?
     let message: String?
+    let compress: Bool?
+    let transfer: WorkflowTransfer?
 
     private func address(for location: Location?, in context: AIFolderContext) async throws -> BrowserAddress {
         guard let location else { return .folder(context.directory) }
         let directory = context.directory
-        let input = try location.input(relativeTo: directory)
+        let input = try location.input(relativeTo: directory, projectDelivery: context.projectDelivery)
         let worker = Task.detached(priority: .userInitiated) { BrowserAddress.resolve(input, relativeTo: directory) }
         let result = await withTaskCancellationHandler { await worker.value } onCancel: { worker.cancel() }
         try Task.checkCancellation()
@@ -136,11 +142,27 @@ struct AIIntent: Decodable, Sendable {
         return folder
     }
 
-    @MainActor func searchFolder(in workspace: BrowserWorkspace, context: AIFolderContext) async throws -> SmartFolder {
+    @MainActor func searchFolder(in workspace: BrowserWorkspace, context: AIFolderContext,
+                                prompt: String? = nil) async throws -> SmartFolder {
         var root = try await folder(for: location, in: context)
-        let conditions = try filters?.conditions() ?? SearchConditions()
+        var conditions = try filters?.conditions() ?? SearchConditions()
         var concepts = try filters?.searchConcepts() ?? []
-        if let project {
+        if concepts.isEmpty, conditions.contents.isEmpty, conditions.kind == nil || conditions.kind == .document,
+           let prompt, let aliases = SearchSemantics.documentTopic(filename: conditions.filename, requestedBy: prompt) {
+            conditions.filename = ""
+            conditions.kind = .document
+            concepts = [aliases]
+        }
+        var scopeID = context.workspaceID
+        var scopeName = context.workspaceName
+        let namedMemory = project.flatMap { workspace.aiMemory.project(named: $0) }
+            ?? workspace.aiMemory.project(mentionedIn: prompt)
+        let remembered = namedMemory ?? (project == nil ? workspace.activeProjectMemory : nil)
+        if location == nil, let remembered, let known = workspace.searchRoot(for: remembered) {
+            root = try await folder(for: Location(place: nil, path: known.path), in: context)
+            scopeID = remembered.id
+            scopeName = remembered.name
+        } else if let project {
             let name = project.trimmingCharacters(in: .whitespacesAndNewlines)
             guard name.count <= 64, name.unicodeScalars.contains(where: CharacterSet.alphanumerics.contains),
                   (try? FileSystem.validateName(name)) != nil,
@@ -159,8 +181,12 @@ struct AIIntent: Decodable, Sendable {
             }
         }
         try Task.checkCancellation()
+        let feedback = prompt.map {
+            SearchMemoryContext(query: $0, root: root, workspaceID: scopeID, workspaceName: scopeName, source: .assistant)
+        }
         return SmartFolder(name: shortName ?? "AI 搜索", root: root, conditions: conditions,
-                           semantics: concepts.isEmpty ? nil : SearchSemantics(concepts: concepts))
+                           semantics: concepts.isEmpty ? nil : SearchSemantics(concepts: concepts),
+                           feedbackContext: feedback)
     }
 
     @MainActor func proposal(in workspace: BrowserWorkspace, context: AIFolderContext) async throws -> AIProposal {
@@ -228,6 +254,8 @@ struct AIIntent: Decodable, Sendable {
                               button: "打开对比") { workspace.presentedTool = .compare }
         case .organize:
             return try await organizationProposal(in: workspace, context: context)
+        case .workflow:
+            return try await workflowProposal(in: workspace, context: context)
         case .workspace:
             guard let name = shortName,
                   let saved = workspace.namedWorkspaces.first(where: {
@@ -239,6 +267,31 @@ struct AIIntent: Decodable, Sendable {
             return AIProposal(title: queue ? "打开传输队列" : "打开操作历史", button: "打开") {
                 workspace.revealOperations(queue ? .transfers : .history)
             }
+        }
+    }
+
+    @MainActor private func workflowProposal(in workspace: BrowserWorkspace, context: AIFolderContext) async throws -> AIProposal {
+        var draft = FileWorkflow(name: shortName.map { String($0.prefix(80)) } ?? "文件流程",
+                                 compresses: compress == true)
+        if rename == .date {
+            draft.rename = BatchRenameRule(style: .modifiedDate)
+        } else if rename == .prefix {
+            guard let prefix, !prefix.isEmpty, prefix.count <= 80 else { throw AIActionError.invalidParameters }
+            draft.rename = BatchRenameRule(style: .prefix, text: prefix)
+        }
+        if let transfer {
+            draft.transfer = transfer == .copy ? .copy : .move
+            if destination?.place == .delivery {
+                draft.usesProjectDelivery = true
+            } else if let destination {
+                draft.destination = try await folder(for: destination, in: context)
+            }
+        }
+        guard draft.hasActions else { throw AIActionError.invalidParameters }
+        let browser = workspace.activeBrowser
+        let request = FileWorkflowRequest(draft: draft, entries: browser.selectedEntries, browser: browser)
+        return AIProposal(title: "查看文件流程「\(draft.name)」", details: [draft.details], button: "查看流程") {
+            workspace.workflowRequest = request
         }
     }
 
@@ -310,10 +363,16 @@ struct AIFolderContext: Sendable {
     let paneID: UUID
     let directory: URL
     let files: [URL]
+    let workspaceID: UUID?
+    let workspaceName: String?
+    let projectDelivery: URL?
     private let browserDirectory: URL
 
     @MainActor init(_ workspace: BrowserWorkspace) {
         tabID = workspace.activeTab.id
+        workspaceID = workspace.activeTab.namedWorkspaceID
+        workspaceName = workspaceID.flatMap { id in workspace.namedWorkspaces.first { $0.id == id }?.name }
+        projectDelivery = workspace.activeProjectMemory?.delivery
         paneID = workspace.activeBrowser.id
         browserDirectory = workspace.activeBrowser.directory
         directory = workspace.activeBrowser.smartFolder?.root ?? workspace.directoryBrowser?.directory ?? browserDirectory
@@ -322,6 +381,7 @@ struct AIFolderContext: Sendable {
 
     @MainActor func matches(_ workspace: BrowserWorkspace) -> Bool {
         tabID == workspace.activeTab.id && paneID == workspace.activeBrowser.id &&
+            workspaceID == workspace.activeTab.namedWorkspaceID && projectDelivery == workspace.activeProjectMemory?.delivery &&
             browserDirectory == workspace.activeBrowser.directory &&
             directory == (workspace.activeBrowser.smartFolder?.root ?? workspace.directoryBrowser?.directory ??
                           workspace.activeBrowser.directory) &&

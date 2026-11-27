@@ -14,13 +14,16 @@ struct TransferDestinationView: View {
     @ViewState private var path = ""
     @ViewState private var resolving = false
     @ViewState private var issue: String?
+    @ViewState private var savesWorkflow = false
+    @ViewState private var workflowName = ""
     @FocusState private var pathFocused: Bool
 
     private var groups: [(String, [URL])] {
         var seen = Set<String>()
         let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
         let filter = trimmed.hasPrefix("/") || trimmed.hasPrefix("~") || trimmed.hasPrefix("file://") ? "" : trimmed
-        return [("收藏", workspace.quickAccessPins.filter(\.isFolder).map(\.url)),
+        return [("工作区交付目录", workspace.activeProjectMemory?.delivery.map { [$0] } ?? []),
+                ("收藏", workspace.quickAccessPins.filter(\.isFolder).map(\.url)),
                 ("最近的目标目录", workspace.recentDestinations),
                 ("已打开的面板", workspace.folderBrowsers.map(\.directory)),
                 ("常用位置", BrowserModel.defaults.map(\.url))].map { name, urls in
@@ -68,6 +71,12 @@ struct TransferDestinationView: View {
                 }
             }
             .frame(minHeight: 205, idealHeight: 285)
+            Toggle("同时保存为文件流程", isOn: $savesWorkflow)
+            if savesWorkflow {
+                TextField("流程名称", text: $workflowName)
+                    .textFieldStyle(.roundedBorder)
+                    .onChange(of: workflowName) { issue = nil }
+            }
             if let issue { Label(issue, systemImage: "exclamationmark.circle").foregroundStyle(.red).font(.caption) }
             HStack {
                 Spacer()
@@ -105,6 +114,15 @@ struct TransferDestinationView: View {
                request.urls.allSatisfy({ $0.deletingLastPathComponent().path == directory.path }) {
                 issue = "所选项目已在该文件夹。"
                 return
+            }
+            if savesWorkflow {
+                let name = workflowName.trimmingCharacters(in: .whitespacesAndNewlines)
+                let workflow = FileWorkflow(name: name, transfer: request.operation == .copy ? .copy : .move,
+                                            destination: directory)
+                guard workflow.isValid, workspace.aiMemory.save(workflow) else {
+                    issue = "请输入唯一的流程名称，最多 80 个字符。"
+                    return
+                }
             }
             if workspace.transfer(request.urls, into: directory, operation: request.operation, fromStash: request.fromStash) {
                 workspace.destinationRequest = nil
