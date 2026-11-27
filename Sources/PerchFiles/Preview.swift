@@ -39,6 +39,10 @@ struct PreviewPane: View {
                     .clipShape(.rect(cornerRadius: 8))
                     .padding(10)
                 Divider()
+                if let hit = highlightedHit {
+                    searchMatch(hit)
+                    Divider()
+                }
                 summary(entry)
             } else if !model.selectedIDs.isEmpty {
                 ContentUnavailableView("已选 \(model.selectedIDs.count) 项", systemImage: "square.on.square")
@@ -62,8 +66,35 @@ struct PreviewPane: View {
                 Button("打开文件夹") { openFolder(entry) }
             }
         } else {
-            FilePreview(entry: entry)
+            FilePreview(entry: entry, initialPage: model.archivePreview == nil ? model.previewContentPage : nil)
         }
+    }
+
+    private var highlightedHit: ContentIndex.Match? {
+        guard model.archivePreview == nil else { return nil }
+        return model.selectedContentHits.first { $0.page == model.previewContentPage }
+            ?? model.selectedContentHits.first
+    }
+
+    private func searchMatch(_ hit: ContentIndex.Match) -> some View {
+        let pages = Array(Set(model.selectedContentHits.map(\.page).filter { $0 > 0 })).sorted()
+        return VStack(alignment: .leading, spacing: 5) {
+            if pages.count > 1 {
+                Menu("命中 · 第 \(hit.page) 页") {
+                    ForEach(pages, id: \.self) { page in
+                        Button("第 \(page) 页") { model.previewSearchPage(page) }
+                    }
+                }.fixedSize()
+            } else {
+                Label(hit.page > 0 ? "命中 · 第 \(hit.page) 页" : "命中 · " + hit.label, systemImage: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+            }
+            Text(hit.excerpt).lineLimit(2).textSelection(.enabled).help(hit.excerpt)
+        }
+        .font(.caption)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 7)
     }
 
     private func summary(_ entry: FileEntry) -> some View {
@@ -116,7 +147,8 @@ struct PreviewPane: View {
 
 struct FilePreview: View {
     let entry: FileEntry
-    @ViewState private var loaded: Loaded?
+    var initialPage: Int? = nil
+    @ViewState private var recent: [Loaded] = []
 
     private struct Loaded {
         let entry: FileEntry
@@ -125,7 +157,7 @@ struct FilePreview: View {
 
     var body: some View {
         Group {
-            switch loaded?.entry == entry ? loaded?.data : nil {
+            switch recent.first(where: { $0.entry == entry })?.data {
             case .text(let text, let monospaced, let highlights):
                 if text.isEmpty {
                     Text("空文件").foregroundStyle(.secondary)
@@ -150,7 +182,7 @@ struct FilePreview: View {
                     .scaledToFit()
                     .accessibilityLabel("图片预览")
             case .pdf(let pdf):
-                PDFPreview(document: pdf.document)
+                PDFPreview(document: pdf.document, page: initialPage)
                     .accessibilityLabel("PDF 预览")
             case .word(let word):
                 WordPreview(document: word.content)
@@ -172,6 +204,13 @@ struct FilePreview: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .task(id: entry) {
+            if let index = recent.firstIndex(where: { $0.entry == entry }) {
+                if index != 0 {
+                    let cached = recent.remove(at: index)
+                    recent.insert(cached, at: 0)
+                }
+                return
+            }
             // Avoid opening intermediate files during rapid keyboard navigation.
             do { try await Task.sleep(for: .milliseconds(35)) } catch { return }
             let file = entry
@@ -182,27 +221,62 @@ struct FilePreview: View {
                 task.cancel()
             }
             guard !Task.isCancelled else { return }
-            loaded = Loaded(entry: file, data: preview)
+            recent.removeAll { $0.entry.id == file.id }
+            recent.insert(Loaded(entry: file, data: preview), at: 0)
+            if recent.count > 3 { recent.removeLast(recent.count - 3) }
         }
     }
 }
 
 private struct PDFPreview: NSViewRepresentable {
     let document: PDFDocument
+    let page: Int?
+
+    @MainActor final class Coordinator: NSObject {
+        var requestedPage: Int?
+
+        @objc func updatePage(_ notification: Notification) {
+            if let view = notification.object as? PDFView { updatePage(in: view) }
+        }
+
+        func updatePage(in view: PDFView) {
+            guard let document = view.document, let page = view.currentPage else { return }
+            let number = document.index(for: page) + 1
+            view.setAccessibilityValue("第 \(number) / \(document.pageCount) 页")
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeNSView(context: Context) -> PDFView {
         let view = PDFView()
         view.displayMode = .singlePageContinuous
         view.displaysPageBreaks = true
         view.autoScales = true
+        view.setAccessibilityLabel("PDF 预览")
+        NotificationCenter.default.addObserver(context.coordinator, selector: #selector(Coordinator.updatePage(_:)),
+                                               name: .PDFViewPageChanged, object: view)
         return view
     }
 
     func updateNSView(_ view: PDFView, context: Context) {
-        guard view.document !== document else { return }
-        view.document = document
-        view.autoScales = true
-        view.documentView?.enclosingScrollView?.scrollerStyle = .overlay
+        let changed = view.document !== document
+        if changed {
+            view.document = document
+            view.autoScales = true
+            view.documentView?.enclosingScrollView?.scrollerStyle = .overlay
+        }
+        guard changed || context.coordinator.requestedPage != page else { return }
+        context.coordinator.requestedPage = page
+        if let page, page > 0, let target = document.page(at: page - 1) {
+            view.layoutSubtreeIfNeeded()
+            view.go(to: target)
+        }
+        context.coordinator.updatePage(in: view)
+    }
+
+    static func dismantleNSView(_ view: PDFView, coordinator: Coordinator) {
+        NotificationCenter.default.removeObserver(coordinator, name: .PDFViewPageChanged, object: view)
     }
 }
 
@@ -347,6 +421,7 @@ private struct EmbeddedQuickLook: NSViewRepresentable {
 
 struct ExpandedPreview: View {
     let entry: FileEntry
+    var initialPage: Int? = nil
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -361,7 +436,7 @@ struct ExpandedPreview: View {
             }
             .padding(14)
             Divider()
-            FilePreview(entry: entry)
+            FilePreview(entry: entry, initialPage: initialPage)
                 .frame(minWidth: 570, idealWidth: 720, minHeight: 400, idealHeight: 490)
         }
     }

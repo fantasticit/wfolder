@@ -20,15 +20,19 @@ struct PaneTransfer: Sendable {
     var fromStash = false
     var preparedDestination: TransferFiles.Destination? = nil
     var expectedSources: [URL: FileStamp]? = nil
+    var reportsDropResult = false
 }
 
 enum FileDropHint: Equatable {
     case stash
     case transfer(URL, PaneTransferOperation)
+    case extract(URL)
 
     var directory: URL? {
-        if case .transfer(let directory, _) = self { return directory }
-        return nil
+        switch self {
+        case .stash: nil
+        case .transfer(let directory, _), .extract(let directory): directory
+        }
     }
 
     var title: String {
@@ -36,6 +40,8 @@ enum FileDropHint: Equatable {
         case .stash: return "加入暂存架"
         case .transfer(let directory, let operation):
             return "\(operation.title)到「\(directory.lastPathComponent.isEmpty ? directory.path : directory.lastPathComponent)」"
+        case .extract(let directory):
+            return "解压到「\(directory.lastPathComponent.isEmpty ? directory.path : directory.lastPathComponent)」"
         }
     }
 }
@@ -56,6 +62,8 @@ final class FileDropScrollView: OverlayScrollView {
 
     private var sources: [URL] = []
     private var volumes: [NSObject] = []
+    private var sourcePaths: [String] = []
+    private var sourceParents: Set<String> = []
     private var fromStash = false
     private var knowsSourceVolumes = false
     private var lastDirectory: URL?
@@ -72,6 +80,8 @@ final class FileDropScrollView: OverlayScrollView {
         sources = urls.filter(\.isFileURL)
         fromStash = (info.draggingSource as? any FileDragSource)?.dragsFromStash == true
         let parentDirectories = Set(sources.map { $0.deletingLastPathComponent() })
+        sourcePaths = sources.map(FileSystem.locationKey)
+        sourceParents = Set(parentDirectories.map(FileSystem.locationKey))
         volumes = parentDirectories.compactMap(Self.volume)
         knowsSourceVolumes = volumes.count == parentDirectories.count
         lastDirectory = nil
@@ -97,8 +107,10 @@ final class FileDropScrollView: OverlayScrollView {
             guard let storeInStash else { return false }
             storeInStash(sources)
             return true
+        case .extract(let directory):
+            guard let archiveDrag else { return false }
+            return receiveArchive?(archiveDrag, directory) == true
         case .transfer(let directory, let operation):
-            if let archiveDrag { return receiveArchive?(archiveDrag, directory) == true }
             return receive(sources, directory, operation, fromStash)
         }
     }
@@ -111,7 +123,7 @@ final class FileDropScrollView: OverlayScrollView {
         if archiveDrag != nil {
             guard receiveArchive != nil, canReceive(), info.draggingSourceOperationMask.contains(.copy),
                   let directory = destination(info.draggingLocation) else { updateHint(nil); return [] }
-            updateHint(.transfer(directory, .copy))
+            updateHint(.extract(directory))
             return .copy
         }
         if storeInStash != nil {
@@ -127,9 +139,9 @@ final class FileDropScrollView: OverlayScrollView {
             lastDirectory = directory
             let targetVolume = Self.volume(directory)
             lastSharesVolume = knowsSourceVolumes && targetVolume != nil && volumes.allSatisfy { $0 == targetVolume }
-            let path = directory.path
-            isRecursive = sources.contains { path == $0.path || path.hasPrefix($0.path + "/") }
-            canMoveIntoDirectory = sources.contains { $0.deletingLastPathComponent().path != path }
+            let path = FileSystem.physicalDirectory(directory).path
+            isRecursive = sourcePaths.contains { path == $0 || path.hasPrefix($0 == "/" ? "/" : $0 + "/") }
+            canMoveIntoDirectory = sourceParents.contains { $0 != path }
         }
         guard let operation = PaneTransferOperation.drag(sameVolume: !fromStash && lastSharesVolume,
                   modifiers: NSEvent.modifierFlags, allowed: info.draggingSourceOperationMask),
@@ -171,6 +183,8 @@ final class FileDropScrollView: OverlayScrollView {
         archiveDrag = nil
         sources.removeAll()
         volumes.removeAll()
+        sourcePaths.removeAll()
+        sourceParents.removeAll()
         lastDirectory = nil
     }
 }

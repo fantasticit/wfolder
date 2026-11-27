@@ -29,8 +29,6 @@ struct BrowserView: View {
             files
                 .navigationTitle(workspace.activeTab.showsQuickAccess ? "快速访问" : model.directoryName)
                 .toolbar { toolbar }
-                .searchable(text: $model.query, isPresented: $model.presentsSearch,
-                            placement: .toolbar, prompt: "搜索文件和文件夹")
                 .inspector(isPresented: inspectorVisibility) {
                     inspectorContent
                         .inspectorColumnWidth(min: workspace.showsAIAssistantSidebar ? 300 : 240,
@@ -68,11 +66,7 @@ struct BrowserView: View {
             workspace.refreshClipboard()
         }
         .onReceive(NotificationCenter.default.publisher(for: .focusFileSearch)) { _ in
-            workspace.showFolderBrowser()
-            model.presentsSearch = true
-        }
-        .onChange(of: model.presentsSearch) { _, visible in
-            if visible { workspace.showFolderBrowser() }
+            showFileSearch()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             workspace.refreshClipboard()
@@ -87,7 +81,9 @@ struct BrowserView: View {
         .sheet(item: $model.prompt) { prompt in
             PromptView(prompt: prompt) { model.submit(prompt, value: $0, format: $1) }
         }
-        .sheet(item: $model.expandedPreview) { ExpandedPreview(entry: $0) }
+        .sheet(item: $model.expandedPreview) { entry in
+            ExpandedPreview(entry: entry, initialPage: entry.id == model.selected?.id ? model.previewContentPage : nil)
+        }
         .sheet(item: Binding(get: { workspace.transferChoice }, set: { workspace.transferChoice = $0 })) { choice in
             TransferTargetPicker(choice: choice, workspace: workspace)
         }
@@ -128,6 +124,17 @@ struct BrowserView: View {
             case .remote: RemoteLocationsView(workspace: workspace)
             case .organization: OrganizationView(workspace: workspace)
             case .agent: AgentTasksView { workspace.presentedTool = nil }
+            case .professional(let page, let files):
+                ProfessionalToolsView(workspace: workspace, page: page, files: files) { folder in
+                    dismissTool { workspace.openContentSearch(in: folder) }
+                }
+            case .contentIndex(let folder, let includesDescendants, let showHidden):
+                VStack(alignment: .trailing, spacing: 12) {
+                    Button("关闭") { workspace.presentedTool = nil }.keyboardShortcut(.cancelAction)
+                    ContentIndexView(workspace: workspace, selectedFolder: folder,
+                                     includesDescendants: includesDescendants, showHidden: showHidden)
+                }
+                .padding(16).frame(width: 760, height: 500)
             case .organizationDraft(let rule): OrganizationView(workspace: workspace, draft: rule)
             case .aiAssistant:
                 AIAssistantView(
@@ -139,6 +146,14 @@ struct BrowserView: View {
                 GoToPathSheet(baseDirectory: workspace.directoryBrowser?.directory ?? model.directory) {
                     workspace.followAddress($0)
                 }
+            }
+        }
+        .task(id: workspace.professional.inbox.folder) {
+            guard workspace.professional.inbox.folder != nil else { return }
+            while !Task.isCancelled {
+                await workspace.professional.inbox.refresh()
+                do { try await Task.sleep(for: .seconds(5)) }
+                catch { break }
             }
         }
         .alert(item: $model.issue) { issue in
@@ -224,6 +239,13 @@ struct BrowserView: View {
                 Button { workspace.openQuickAccess() } label: {
                     SidebarItemLabel(title: "快速访问", symbol: "house")
                         .fontWeight(workspace.activeTab.showsQuickAccess ? .semibold : .regular)
+                }
+                .buttonStyle(.plain)
+                .selectionDisabled()
+                Button {
+                    workspace.presentedTool = .professional(nil, model.selectedEntries.map(\.url))
+                } label: {
+                    SidebarItemLabel(title: "文件工具", symbol: "wrench.and.screwdriver")
                 }
                 .buttonStyle(.plain)
                 .selectionDisabled()
@@ -461,6 +483,9 @@ struct BrowserView: View {
                 Button("命令面板…", systemImage: "command") { workspace.presentedTool = .commands }
                 Button("服务器与磁盘…", systemImage: "network") { workspace.presentedTool = .remote }
                 Button("整理规则…", systemImage: "tray.and.arrow.down") { workspace.presentedTool = .organization }
+                Button("文件工具…", systemImage: "wrench.and.screwdriver") {
+                    workspace.presentedTool = .professional(nil, model.selectedEntries.map(\.url))
+                }
                 Button("Spotlight 搜索…", systemImage: "magnifyingglass") { workspace.presentedTool = .spotlight }
             } label: {
                 Label("工作区工具", systemImage: "briefcase")
@@ -472,7 +497,14 @@ struct BrowserView: View {
                 Label(model.showPreview ? "隐藏预览" : "显示预览", systemImage: "sidebar.right")
             }
             .help(model.showPreview ? "隐藏预览（⌥⌘P）" : "显示预览（⌥⌘P）")
+            Button("搜索", systemImage: "magnifyingglass", action: showFileSearch)
+                .help("搜索文件（⌘F）")
         }
+    }
+
+    private func showFileSearch() {
+        workspace.showFolderBrowser()
+        workspace.activeBrowser.beginFileSearch()
     }
 
     private var files: some View {
@@ -485,7 +517,39 @@ struct BrowserView: View {
             } else {
                 PaneWorkspaceView(tab: tab, workspace: workspace).id(tab.id)
             }
+            if let result = workspace.dropResult {
+                Divider()
+                dropResultBar(result)
+            }
         }
+    }
+
+    private func dropResultBar(_ result: BrowserWorkspace.DropResult) -> some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 3) {
+                Label(result.undoNote ?? result.message,
+                      systemImage: result.needsReview ? "exclamationmark.circle" : "checkmark.circle")
+                    .font(.callout.weight(.medium)).lineLimit(1)
+                Text((result.target.path as NSString).abbreviatingWithTildeInPath)
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                    .help(result.target.path)
+            }
+            Spacer(minLength: 8)
+            if result.undoNote != "已撤销" && !result.files.isEmpty {
+                Button("显示结果") { workspace.revealDropResult(result) }
+            }
+            if workspace.canUndoDropResult(result) {
+                Button("撤销") { workspace.undoDropResult(result) }
+            }
+            if result.needsReview || (result.undoNote != nil && result.undoNote != "已撤销") {
+                Button("查看详情") { workspace.revealOperations(result.undoNote == nil ? .transfers : .history) }
+            }
+            Button("关闭传输结果", systemImage: "xmark", action: workspace.dismissDropResult)
+                .labelStyle(.iconOnly).buttonStyle(.borderless).help("关闭")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(.bar)
     }
 
     private func chooseFolder() {
@@ -673,6 +737,7 @@ private struct BrowserPane: View {
     let isActive: Bool
 
     @ViewState private var fileListFocusRequest = 0
+    @FocusState private var focusesSearch
     @ViewState private var dropHint: FileDropHint?
 
     var body: some View {
@@ -714,7 +779,8 @@ private struct BrowserPane: View {
                         Button("重试") { model.refresh() }
                     }
                 } else if model.searchingDescendants && entries.isEmpty {
-                    ProgressView("正在搜索…").controlSize(.small).allowsHitTesting(false)
+                    ProgressView(model.searchesContent ? "正在查找文件里的文字…" : "正在搜索…")
+                        .controlSize(.small).allowsHitTesting(false)
                 } else if model.smartSearchStopped && entries.isEmpty {
                     ContentUnavailableView("搜索已停止", systemImage: "magnifyingglass")
                 } else if entries.isEmpty {
@@ -733,6 +799,13 @@ private struct BrowserPane: View {
                     }
                 }
             }
+            .overlay(alignment: .top) {
+                if let dropHint {
+                    dropTargetBanner(dropHint)
+                        .padding(10)
+                        .allowsHitTesting(false)
+                }
+            }
         }
         .safeAreaInset(edge: .top, spacing: 0) {
             VStack(spacing: 0) {
@@ -742,7 +815,9 @@ private struct BrowserPane: View {
                     BrowserNavigation(workspace: workspace, model: model, isActive: isActive,
                                       focusFileList: focusFileList)
                 }
-                if !model.isVirtual, model.zipArchive == nil, model.presentsSearch || model.hasSearch { searchControls(model) }
+                if model.zipArchive == nil, model.presentsSearch || model.hasSearch {
+                    searchControls(model)
+                }
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -759,6 +834,12 @@ private struct BrowserPane: View {
         }
         .onChange(of: model.viewMode) { if isActive && !model.presentsSearch { focusFileList() } }
         .onChange(of: workspace.paneFocusRequest) { if isActive { focusFileList() } }
+        .onChange(of: model.fileSearchFocusRequest) {
+            if isActive { focusesSearch = true }
+        }
+        .onChange(of: focusesSearch) { _, focused in
+            if focused { workspace.activatePane(model) }
+        }
         .onChange(of: model.directory) {
             dropHint = nil
             workspace.followLinkedNavigation(from: model)
@@ -817,30 +898,29 @@ private struct BrowserPane: View {
         if dropHint != hint { dropHint = hint }
     }
 
+    private func dropTargetBanner(_ hint: FileDropHint) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label(hint.title, systemImage: hint == .stash ? "tray.and.arrow.down" : "arrow.down.to.line")
+                .font(.callout.weight(.semibold)).lineLimit(1)
+            if let directory = hint.directory {
+                Text((directory.path as NSString).abbreviatingWithTildeInPath)
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+            }
+            if case .transfer = hint {
+                Text("⌥ 复制 · ⌘ 移动").font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(.regularMaterial, in: .rect(cornerRadius: 8))
+        .overlay { RoundedRectangle(cornerRadius: 8).strokeBorder(Color.accentColor.opacity(0.6)) }
+    }
+
     private func searchControls(_ model: BrowserModel) -> some View {
-        let roots = model.searchDirectories.map(\.path)
         return VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 6) {
-                ViewThatFits(in: .horizontal) {
-                    HStack(spacing: 8) { scopePicker(model); searchFilters(model) }
-                    VStack(alignment: .leading, spacing: 6) { scopePicker(model); searchFilters(model) }
-                }
-                HStack(spacing: 6) {
-                    Image(systemName: "folder")
-                    Text(roots.first.map { roots.count == 1 ? $0 : "\($0) 等 \(roots.count) 个目录" } ?? "")
-                        .lineLimit(1).truncationMode(.middle)
-                        .help(roots.joined(separator: "\n"))
-                        .accessibilityLabel("搜索目录 " + roots.joined(separator: "，"))
-                    Spacer(minLength: 0)
-                    if model.searchingDescendants {
-                        ProgressView().controlSize(.mini)
-                        Button("停止", action: model.stopFolderSearch)
-                    } else if let notice = model.searchNotice {
-                        Text(notice).lineLimit(1).help(notice)
-                    }
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                searchField(model)
+                if !model.isVirtual { searchOptions(model) }
             }
             .controlSize(.small)
             .padding(.horizontal, 12)
@@ -848,6 +928,93 @@ private struct BrowserPane: View {
             Divider()
         }
         .background(.bar)
+    }
+
+    private func searchField(_ model: BrowserModel) -> some View {
+        @Bindable var model = model
+        let label = model.searchMode == .content && !model.isVirtual ? "搜索文件里的文字" : "搜索文件和文件夹"
+        return HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass").foregroundStyle(.secondary).accessibilityHidden(true)
+            TextField(label, text: $model.query)
+                .textFieldStyle(.plain)
+                .accessibilityLabel(label)
+                .focused($focusesSearch)
+                .onAppear { if isActive && model.presentsSearch { focusesSearch = true } }
+                .onExitCommand { closeSearch(model) }
+            Button("关闭搜索", systemImage: "xmark.circle.fill") { closeSearch(model) }
+                .labelStyle(.iconOnly).buttonStyle(.borderless).foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 6)
+        .background(.quaternary, in: .rect(cornerRadius: 6))
+    }
+
+    private func closeSearch(_ model: BrowserModel) {
+        focusesSearch = false
+        model.dismissFileSearch()
+        focusFileList()
+    }
+
+    private func searchOptions(_ model: BrowserModel) -> some View {
+        let roots = model.searchDirectories.map(\.path)
+        return VStack(alignment: .leading, spacing: 6) {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) { searchModePicker(model); scopePicker(model); searchFilters(model) }
+                VStack(alignment: .leading, spacing: 6) {
+                    ViewThatFits(in: .horizontal) {
+                        HStack(spacing: 8) {
+                            searchModePicker(model)
+                            scopePicker(model)
+                        }
+                        VStack(alignment: .leading, spacing: 6) {
+                            searchModePicker(model)
+                            scopePicker(model)
+                        }
+                    }
+                    searchFilters(model)
+                }
+            }
+            HStack(spacing: 6) {
+                Image(systemName: "folder")
+                Text(roots.first.map { roots.count == 1 ? $0 : "\($0) 等 \(roots.count) 个目录" } ?? "")
+                    .lineLimit(1).truncationMode(.middle)
+                    .help(roots.joined(separator: "\n"))
+                    .accessibilityLabel("搜索目录 " + roots.joined(separator: "，"))
+                Spacer(minLength: 0)
+                if model.searchingDescendants {
+                    ProgressView().controlSize(.mini)
+                    Button("停止", action: model.stopFolderSearch)
+                } else {
+                    if let notice = model.searchNotice { Text(notice).lineLimit(1).help(notice) }
+                    if model.searchesContent {
+                        Menu("内容搜索设置") {
+                            Button("重新读取文件内容", action: model.refreshContentSearch)
+                            Button("管理目录索引…") {
+                                workspace.presentedTool = .contentIndex(model.directory,
+                                    includesDescendants: model.searchScope != .current, showHidden: workspace.showHidden)
+                            }
+                        }
+                        .fixedSize()
+                    }
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+    }
+
+    private func searchModePicker(_ model: BrowserModel) -> some View {
+        Picker("搜索内容", selection: Binding(get: { model.searchMode }, set: { mode in
+            guard mode != .content || workspace.grantContentSearchAccess() else { return }
+            workspace.activatePane(model)
+            model.searchMode = mode
+        })) {
+            ForEach(FileSearchMode.allCases) { mode in Text(mode.rawValue).tag(mode) }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .fixedSize()
+        .accessibilityLabel("搜索内容")
     }
 
     private func scopePicker(_ model: BrowserModel) -> some View {
@@ -902,11 +1069,6 @@ private struct BrowserPane: View {
                     Button("重新搜索") { model.refresh() }
                 } else if model.smartFolder != nil, let notice = model.searchNotice {
                     Label(notice, systemImage: "exclamationmark.circle").lineLimit(1).help(notice)
-                } else if let dropHint {
-                    Text(dropHint.title)
-                        .lineLimit(1)
-                        .help(dropHint.directory?.path ?? dropHint.title)
-                        .foregroundStyle(Color.accentColor)
                 } else if let job = workspace.transfers.active {
                     Button {
                         workspace.revealOperations(.transfers)

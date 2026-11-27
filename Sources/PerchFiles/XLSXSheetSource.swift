@@ -1,5 +1,4 @@
 import Foundation
-import SQLite3
 
 struct XLSXSheetSource: PreviewGridSource {
     let id = UUID()
@@ -22,7 +21,7 @@ struct XLSXSheetSource: PreviewGridSource {
         if let strings = workbook.sharedStrings, strings != sheet.path { parts[strings] = stringsFile }
         try ZipContents.copyParts(parts, from: workbook.url, maxPartBytes: 1 << 30)
 
-        let db = try XLSXDatabase(url: dictionary.file("cells.sqlite"), writable: true)
+        let db = try SQLiteDatabase(url: dictionary.file("cells.sqlite"), writable: true)
         try db.execute("""
             PRAGMA journal_mode=WAL;
             PRAGMA synchronous=NORMAL;
@@ -40,7 +39,7 @@ struct XLSXSheetSource: PreviewGridSource {
     }
 
     func readPage(at start: PreviewPageStart, block: Int) throws -> [[PreviewCell]] {
-        let db = try XLSXDatabase(url: dictionary.file("cells.sqlite"), writable: false)
+        let db = try SQLiteDatabase(url: dictionary.file("cells.sqlite"), writable: false)
         let query = try db.prepare("""
             SELECT cells.r, cells.c, COALESCE(strings.value, cells.value)
             FROM cells LEFT JOIN strings ON strings.id = cells.shared
@@ -76,9 +75,9 @@ private final class XLSXSheetXML: XLSXXMLReader {
         var formula = ""
     }
 
-    private let db: XLSXDatabase
+    private let db: SQLiteDatabase
     private let kind: Kind
-    private let insert: XLSXStatement
+    private let insert: SQLiteStatement
     private let publish: (PreviewIndexBatch) -> Void
     private var row = -1
     private var nextColumn = 0
@@ -94,7 +93,7 @@ private final class XLSXSheetXML: XLSXXMLReader {
     private var publishedPages = 0
     private var nextUpdate: UInt64 = 0
 
-    init(db: XLSXDatabase, kind: Kind, publish: @escaping (PreviewIndexBatch) -> Void = { _ in }) throws {
+    init(db: SQLiteDatabase, kind: Kind, publish: @escaping (PreviewIndexBatch) -> Void = { _ in }) throws {
         self.db = db
         self.kind = kind
         self.publish = publish
@@ -206,70 +205,5 @@ private final class XLSXSheetXML: XLSXXMLReader {
             guard value <= 16_384 else { return nil }
         }
         return value > 0 ? value - 1 : nil
-    }
-}
-
-private final class XLSXDatabase {
-    private let handle: OpaquePointer
-
-    init(url: URL, writable: Bool) throws {
-        let flags = writable ? SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE : SQLITE_OPEN_READONLY
-        var handle: OpaquePointer?
-        let result = url.withUnsafeFileSystemRepresentation { sqlite3_open_v2($0, &handle, flags, nil) }
-        guard result == SQLITE_OK, let handle else {
-            if let handle { sqlite3_close_v2(handle) }
-            throw XLSXError.invalid
-        }
-        self.handle = handle
-        sqlite3_busy_timeout(handle, 500)
-    }
-
-    deinit { sqlite3_close_v2(handle) }
-
-    func execute(_ sql: String) throws {
-        guard sqlite3_exec(handle, sql, nil, nil, nil) == SQLITE_OK else { throw XLSXError.invalid }
-    }
-
-    func prepare(_ sql: String) throws -> XLSXStatement {
-        var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK,
-              let statement else { throw XLSXError.invalid }
-        return XLSXStatement(statement)
-    }
-}
-
-private final class XLSXStatement {
-    private let handle: OpaquePointer
-    private static let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-
-    init(_ handle: OpaquePointer) { self.handle = handle }
-    deinit { sqlite3_finalize(handle) }
-
-    func bind(_ value: Int, to index: Int32) throws {
-        guard sqlite3_bind_int64(handle, index, Int64(value)) == SQLITE_OK else { throw XLSXError.invalid }
-    }
-
-    func bind(_ value: String, to index: Int32) throws {
-        guard sqlite3_bind_text(handle, index, value, -1, Self.transient) == SQLITE_OK else { throw XLSXError.invalid }
-    }
-
-    func run() throws {
-        guard sqlite3_step(handle) == SQLITE_DONE else { throw XLSXError.invalid }
-        sqlite3_reset(handle)
-        sqlite3_clear_bindings(handle)
-    }
-
-    func next() throws -> Bool {
-        switch sqlite3_step(handle) {
-        case SQLITE_ROW: return true
-        case SQLITE_DONE: return false
-        default: throw XLSXError.invalid
-        }
-    }
-
-    func integer(_ index: Int32) -> Int { Int(sqlite3_column_int64(handle, index)) }
-
-    func string(_ index: Int32) -> String {
-        sqlite3_column_text(handle, index).map { String(cString: $0) } ?? ""
     }
 }

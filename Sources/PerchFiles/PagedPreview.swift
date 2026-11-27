@@ -245,15 +245,10 @@ private struct PagedGrid: NSViewRepresentable {
             }
             if rowsChanged { table.noteNumberOfRowsChanged() }
             fitDocument()
-            if first, rows > 0 {
-                scroll.tile()
-                let clip = scroll.contentView
-                clip.scroll(to: NSPoint(x: 0, y: -clip.contentInsets.top))
-                scroll.reflectScrolledClipView(clip)
-            }
+            if first, rows > 0 { (scroll as? OverlayScrollView)?.scrollToDocumentStart() }
             status.wrappedValue = PreviewStatus(rows: rows, columns: columns, finished: batch.finished,
                                                error: status.wrappedValue.error)
-            loadViewport()
+            viewportChanged()
         }
 
         private func report(_ error: Error) {
@@ -288,9 +283,10 @@ private struct PagedGrid: NSViewRepresentable {
             let firstBlock = firstColumn / PagedPreviewSource.blockColumns
             let lastBlock = lastColumn / PagedPreviewSource.blockColumns
 
-            wanted = (firstPage...lastPage).flatMap { page in
+            let visibleTiles = (firstPage...lastPage).flatMap { page in
                 (firstBlock...lastBlock).map { Tile(page: page, block: $0) }
             }
+            wanted = visibleTiles
             if firstPage > 0 {
                 wanted.append(Tile(page: firstPage - 1, block: firstBlock))
             }
@@ -304,7 +300,10 @@ private struct PagedGrid: NSViewRepresentable {
                 wanted.append(Tile(page: firstPage, block: firstBlock - 1))
             }
 
-            for (key, task) in loading where !wanted.contains(key) {
+            let needsVisibleTile = visibleTiles.contains {
+                pages.indices.contains($0.page) && cache[$0] == nil && loading[$0] == nil && !failedTiles.contains($0)
+            }
+            for (key, task) in loading where !wanted.contains(key) || (needsVisibleTile && !visibleTiles.contains(key)) {
                 task.cancel()
                 loading.removeValue(forKey: key)
             }

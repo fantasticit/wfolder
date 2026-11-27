@@ -53,7 +53,7 @@ struct DirectoryDrop: ViewModifier {
             defer { hint = nil }
             guard let operation = operation() else { return false }
             return workspace.transfer(sources, into: directory, operation: operation,
-                                      fromStash: workspace.activeBrowser.isStash)
+                                      fromStash: workspace.activeBrowser.isStash, reportsDropResult: true)
         }
 
         private func updateHint() {

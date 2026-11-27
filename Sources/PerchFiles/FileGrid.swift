@@ -76,6 +76,7 @@ struct FileGrid: NSViewRepresentable {
             grid.endMarquee()
             coordinator.listingID = listing.id
             coordinator.entries = listing.entries
+            coordinator.contentMatches = listing.contentMatches
             coordinator.mode = mode
             coordinator.showsLocation = showsLocation
             coordinator.showExtensions = showExtensions
@@ -86,9 +87,20 @@ struct FileGrid: NSViewRepresentable {
         }
         if directoryChanged {
             coordinator.directory = model.directory
-            let clip = scroll.contentView
-            clip.scroll(to: .zero)
-            scroll.reflectScrolledClipView(clip)
+            coordinator.needsScrollReset = true
+        }
+        if coordinator.needsScrollReset, directoryChanged || dataChanged, let scroll = scroll as? FileDropScrollView {
+            scroll.scrollToDocumentStart()
+            coordinator.needsScrollReset = listing.entries.isEmpty
+            if selection.isEmpty, !coordinator.needsScrollReset {
+                let request = listing.id
+                let origin = scroll.contentView.bounds.origin
+                DispatchQueue.main.async { [weak scroll, weak coordinator] in
+                    guard let scroll, let coordinator, coordinator.listingID == request,
+                          coordinator.actions.model.selectedIDs.isEmpty, scroll.contentView.bounds.origin == origin else { return }
+                    scroll.scrollToDocumentStart()
+                }
+            }
         }
         let selected = Set(selection.compactMap { listing.rows[$0] }.map { IndexPath(item: $0, section: 0) })
         if grid.selectionIndexPaths != selected {
@@ -119,8 +131,10 @@ struct FileGrid: NSViewRepresentable {
 
         let actions: BrowserFileActions
         var entries: [FileEntry] = []
+        var contentMatches: [URL: [ContentIndex.Match]] = [:]
         var listingID: UUID?
         var directory: URL?
+        var needsScrollReset = false
         var mode: FileViewMode = .details
         var showsLocation = false
         var showExtensions = true
@@ -188,7 +202,8 @@ struct FileGrid: NSViewRepresentable {
         func collectionView(_ collectionView: NSCollectionView, itemForRepresentedObjectAt indexPath: IndexPath) -> NSCollectionViewItem {
             let item = collectionView.makeItem(withIdentifier: FileGridItem.identifier, for: indexPath)
             if let item = item as? FileGridItem, let entry = entry(at: indexPath) {
-                item.configure(entry, mode: mode, showsLocation: showsLocation, showExtensions: showExtensions)
+                item.configure(entry, mode: mode, showsLocation: showsLocation, showExtensions: showExtensions,
+                               hit: contentMatches[entry.id]?.first)
                 item.configureCheckbox(visible: showsCheckboxes, name: entry.filename) { [weak self, weak collectionView] in
                     guard let self, let collectionView, self.entry(at: indexPath)?.id == entry.id else { return }
                     self.actions.activate()
@@ -617,7 +632,7 @@ private final class FileGridItem: NSCollectionViewItem {
         checkbox.configure(visible: visible, name: name, selected: isSelected, onToggle: onToggle)
     }
 
-    func configure(_ entry: FileEntry, mode: FileViewMode, showsLocation: Bool, showExtensions: Bool) {
+    func configure(_ entry: FileEntry, mode: FileViewMode, showsLocation: Bool, showExtensions: Bool, hit: ContentIndex.Match?) {
         self.entry = entry
         thumbnailKey = nil
         picture.duration = nil
@@ -638,14 +653,17 @@ private final class FileGridItem: NSCollectionViewItem {
         nameLabel.preferredMaxLayoutWidth = Self.size(for: mode, showsLocation: showsLocation).width
             - 2 * Self.horizontalPadding
         nameLabel.stringValue = entry.displayName(showExtensions: showExtensions)
-        kindLabel.stringValue = entry.cloudStatus.map { entry.kind + " · " + $0.rawValue } ?? entry.kind
+        let excerpt = hit.map { $0.label + " · " + $0.excerpt }
+        kindLabel.stringValue = excerpt ?? entry.cloudStatus.map { entry.kind + " · " + $0.rawValue } ?? entry.kind
+        kindLabel.lineBreakMode = hit == nil ? .byTruncatingMiddle : .byTruncatingTail
         let path = entry.url.deletingLastPathComponent().path
         location.isHidden = !showsLocation
         location.stringValue = showsLocation ? (path as NSString).abbreviatingWithTildeInPath : ""
         let fullName = entry.filename
         let help = showsLocation ? fullName + "\n" + path : fullName
         let wrappedName = Self.wrapTooltip(fullName)
-        let tooltip = showsLocation ? wrappedName + "\n" + Self.wrapTooltip(path) : wrappedName
+        let tooltip = ([wrappedName] + (showsLocation ? [Self.wrapTooltip(path)] : []) + (excerpt.map { [Self.wrapTooltip($0)] } ?? []))
+            .joined(separator: "\n")
         for target in [view, picture, nameLabel, kindLabel, location] {
             target.toolTip = tooltip
         }

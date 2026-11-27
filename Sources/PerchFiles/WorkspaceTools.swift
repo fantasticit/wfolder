@@ -5,6 +5,8 @@ enum WorkspaceTool: Identifiable {
     case workspaces, batchRename(BrowserModel, [FileEntry]), compare, spotlight, goToPath
     case advancedSearch(SmartFolder?), commands, remote, organization, organizationDraft(OrganizationRule), aiAssistant, agent
 
+    case professional(ProfessionalPage?, [URL]), contentIndex(URL, includesDescendants: Bool, showHidden: Bool)
+
     var id: String {
         switch self {
         case .workspaces: return "workspaces"
@@ -19,6 +21,8 @@ enum WorkspaceTool: Identifiable {
         case .organizationDraft(let rule): return "organizationDraft-\(rule.id)"
         case .aiAssistant: return "aiAssistant"
         case .agent: return "agent"
+        case .contentIndex: return "contentIndex"
+        case .professional(let page, _): return "professional-" + (page?.rawValue ?? "home")
         }
     }
 }
