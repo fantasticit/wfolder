@@ -63,7 +63,8 @@ struct AIClient: Sendable {
         let text = AIReplyText(response.text).body
         guard !text.isEmpty else { throw AIServiceError.response }
         if let (intent, json) = try? Self.decodeIntent(text) {
-            guard [.search, .searchResults, .workflow, .answer].contains(intent.action) else { throw AIServiceError.response }
+            // Compatible providers may return action JSON in content instead of tool_calls.
+            // Both transports produce proposals subject to the same permission checks.
             return Reply(intent: intent, text: "", exchange: AIExchange(user: prompt, assistant: json))
         }
         return Reply(intent: nil, text: text, exchange: AIExchange(user: prompt, assistant: text))
