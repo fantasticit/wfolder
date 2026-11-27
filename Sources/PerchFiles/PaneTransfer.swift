@@ -18,6 +18,8 @@ struct PaneTransfer: Sendable {
     let directory: URL
     let operation: PaneTransferOperation
     var fromStash = false
+    var preparedDestination: TransferFiles.Destination? = nil
+    var expectedSources: [URL: FileStamp]? = nil
 }
 
 enum FileDropHint: Equatable {

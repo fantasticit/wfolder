@@ -35,7 +35,7 @@ struct AIClient: Sendable {
         let (bytes, _) = try await start(prompt, history: history, connection: connection, stream: false)
         defer { bytes.task.cancel() }
         let response = try Self.decodeChat(await read(bytes))
-        let (intent, json) = try Self.decodeIntent(response.arguments ?? response.text)
+        let (intent, json) = try Self.decodeIntent(response.arguments ?? AIReplyText(response.text).body)
         return (intent, AIExchange(user: prompt, assistant: json))
     }
 
@@ -58,15 +58,20 @@ struct AIClient: Sendable {
         }
         if let arguments = response.arguments {
             let (intent, json) = try Self.decodeIntent(arguments)
-            return Reply(intent: intent, text: response.text, exchange: AIExchange(user: prompt, assistant: json))
+            return Reply(intent: intent, text: Self.visibleReply(response.text), exchange: AIExchange(user: prompt, assistant: json))
         }
-        let text = response.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = AIReplyText(response.text).body
         guard !text.isEmpty else { throw AIServiceError.response }
-        if let (intent, json) = try? Self.decodeIntent(text),
-           intent.action == .search || intent.action == .searchResults {
+        if let (intent, json) = try? Self.decodeIntent(text) {
+            guard [.search, .searchResults, .workflow, .answer].contains(intent.action) else { throw AIServiceError.response }
             return Reply(intent: intent, text: "", exchange: AIExchange(user: prompt, assistant: json))
         }
         return Reply(intent: nil, text: text, exchange: AIExchange(user: prompt, assistant: text))
+    }
+
+    static func visibleReply(_ text: String) -> String {
+        let body = AIReplyText(text).body
+        return (try? decodeIntent(body)) == nil ? body : ""
     }
 
     private func start(_ prompt: String, history: [AIExchange], connection: AIConnection, stream: Bool) async throws
@@ -78,9 +83,8 @@ struct AIClient: Sendable {
             request.setValue("Bearer " + key, forHTTPHeaderField: "Authorization")
         }
         let format = stream
-            ? "Use the wfolder_action tool once for a file operation or to look up previous search results. For other questions, reply in Markdown. Never put action JSON in the reply text."
+            ? "Use the wfolder_action tool once for a file operation or to look up previous search results. Reply in the user's language. Never repeat action JSON or internal local search status in reply text."
             : "Return exactly one JSON object describing the action. For conversation, return the answer action with a message field."
-        var messages = [["role": "system", "content": format + "\n" + Self.instructions]]
         var recent: [AIExchange] = []
         var remaining = 48 * 1024
         for exchange in history.suffix(8).reversed() {
@@ -89,10 +93,15 @@ struct AIClient: Sendable {
             remaining -= size
             recent.append(exchange)
         }
+        let lastSearch = recent.compactMap(\.searchOutcome).first(where: { $0.range(
+            of: #"^Completed\. Match count: [0-9]+\. Unreadable directories: [0-9]+\. Use searchResults to show file names locally\.$"#,
+            options: .regularExpression) != nil })
+        let localContext = lastSearch.map { "\nInternal status of the latest local search (for planning only): " + $0 } ?? ""
+        var messages = [["role": "system", "content": format + "\n" + Self.instructions + localContext]]
         for exchange in recent.reversed() {
             messages.append(["role": "user", "content": exchange.user])
-            let outcome = exchange.searchOutcome.map { "\n\nVerified local search outcome: " + $0 } ?? ""
-            messages.append(["role": "assistant", "content": exchange.assistant + outcome])
+            let previousReply = AIReplyText(exchange.assistant).body
+            if !previousReply.isEmpty { messages.append(["role": "assistant", "content": previousReply]) }
         }
         messages.append(["role": "user", "content": prompt])
         var body: [String: Any] = [
@@ -152,16 +161,16 @@ struct AIClient: Sendable {
         for try await byte in bytes {
             received += 1
             guard received <= 2 * 1024 * 1024 else { throw AIServiceError.response }
-            if try stream.consume(byte), stream.canShowText,
+            if try stream.consume(byte), let text = stream.visibleText,
                lastUpdate.map({ $0.duration(to: clock.now) >= .milliseconds(45) }) ?? true {
                 lastUpdate = clock.now
-                await onText(stream.text)
+                await onText(text)
             }
             if stream.ended { break }
         }
         try Task.checkCancellation()
         try stream.complete()
-        if stream.canShowText { await onText(stream.text) }
+        if let text = stream.visibleText { await onText(text) }
         return Completion(text: stream.text, arguments: stream.arguments)
     }
 
@@ -181,8 +190,9 @@ struct AIClient: Sendable {
 
     private static func decodeIntent(_ text: String) throws -> (AIIntent, String) {
         var json = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if json.hasPrefix("```"), json.hasSuffix("```"), let newline = json.firstIndex(of: "\n") {
-            json = String(json[json.index(after: newline)...].dropLast(3))
+        if json.hasPrefix("```"), let newline = json.firstIndex(of: "\n") {
+            json = String(json[json.index(after: newline)...])
+            if json.hasSuffix("```") { json = String(json.dropLast(3)) }
         }
         guard let intent = try? JSONDecoder().decode(AIIntent.self, from: Data(json.utf8)) else {
             throw AIServiceError.response
@@ -212,7 +222,7 @@ struct AIClient: Sendable {
       "required":["action"],
       "additionalProperties":false,
       "properties":{
-        "action":{"type":"string","enum":["search","searchResults","navigate","split","switchPane","view","preview","stash","copy","move","compare","organize","workspace","queue","history"]},
+        "action":{"type":"string","enum":["search","searchResults","navigate","split","switchPane","view","preview","stash","copy","move","compare","organize","workspace","queue","history","workflow"]},
         "location":{"type":"object","properties":{"place":{"type":"string"},"path":{"type":"string"}}},
         "destination":{"type":"object","properties":{"place":{"type":"string"},"path":{"type":"string"}}},
         "filters":{"type":"object","properties":{"filename":{"type":"string"},"contents":{"type":"string"},"tag":{"type":"string"},
@@ -220,7 +230,8 @@ struct AIClient: Sendable {
           "days":{"type":"integer"},"recursive":{"type":"boolean"},"concepts":{"type":"array","maxItems":5,
             "items":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string","maxLength":64}}}}},
         "name":{"type":"string"},"project":{"type":"string"},"direction":{"type":"string"},"view":{"type":"string"},"enabled":{"type":"boolean"},
-        "rename":{"type":"string"},"prefix":{"type":"string"},"groupBy":{"type":"string"},"previewOnly":{"type":"boolean"}
+        "rename":{"type":"string"},"prefix":{"type":"string"},"groupBy":{"type":"string"},"previewOnly":{"type":"boolean"},
+        "compress":{"type":"boolean"},"transfer":{"type":"string","enum":["copy","move"]}
       }
     }
     """
@@ -251,12 +262,16 @@ struct AIClient: Sendable {
     For requests such as “整理下载目录”, use organize with the downloads location and groupBy "kind".
     Organize direct files by default. Set filters.recursive only when the user requests subdirectories.
     Without a destination or rename, organize groups files by type in the source folder.
+    workflow: build a reusable flow on the selected items when the user asks to save a flow or combine
+    renaming, ZIP compression and transfer. Set name, optional rename "date" or "prefix", prefix if needed,
+    compress (boolean), transfer "copy" or "move", and destination. The app will show the draft for review.
+    Say place "delivery" for a workspace delivery folder. Omit destination when the user will choose it.
     workspace: name of a saved workspace
     queue: open the transfers panel; history: open the operations history
     answer: message in the user's language with a short answer or a clarification question
 
     location and destination are objects with "place" (current, home, desktop, documents, downloads, pictures,
-    applications), or "path" (literal user-supplied file path). Do not combine place and path.
+    applications, delivery), or "path" (literal user-supplied file path). Do not combine place and path.
     When filters are present use fields "filename", "contents", "tag", "extensions" (array of strings, for
     example ["pdf","zip"]), "kind" (folder, image, video, audio, document, archive), "minimumMB" (number),
     "days" (integer, modified within N days), and "recursive" (boolean). Only use applicable fields.
@@ -265,12 +280,15 @@ struct AIClient: Sendable {
     Every concept must match; its alternatives can match the name, folder path, or locally searchable content.
     Use filename only for explicit filename matches, and contents only for explicit literal content matches.
     Set kind to document for document requests, so “document” does not become a required keyword.
-    Put a named project in project and omit location unless the user specifies a search scope.
+    Put a named project or its alias exactly as quoted by the user in project and omit location unless the user specifies a search scope.
+    When no directory is specified, omit location so the app can use the current project's remembered search scope.
 
     Example for “找下载里最近 7 天超过 10 MB 的 PDF”:
     {"action":"search","location":{"place":"downloads"},"filters":{"extensions":["pdf"],"days":7,"minimumMB":10}}
     Example for “搜一下 aigc 的架构文档”:
     {"action":"search","project":"aigc","name":"AIGC 架构文档","filters":{"kind":"document","concepts":[["架构","系统设计","技术方案","architecture","system design","technical design","tech design","design spec"]]}}
+    Example for “查一下架构设计文档”:
+    {"action":"search","filters":{"kind":"document","concepts":[["架构","系统设计","architecture","technical design","tech design"]]}}
     Example for “把选中的文件移到文稿”:
     {"action":"move","destination":{"place":"documents"}}
     Example for “帮我整理下载目录”:

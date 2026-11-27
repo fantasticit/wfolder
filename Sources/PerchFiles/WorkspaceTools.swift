@@ -3,7 +3,7 @@ import UniformTypeIdentifiers
 
 enum WorkspaceTool: Identifiable {
     case workspaces, batchRename(BrowserModel, [FileEntry]), compare, spotlight, goToPath
-    case advancedSearch(SmartFolder?), commands, remote, organization, organizationDraft(OrganizationRule), aiAssistant
+    case advancedSearch(SmartFolder?), commands, remote, organization, organizationDraft(OrganizationRule), aiAssistant, agent
 
     var id: String {
         switch self {
@@ -18,6 +18,7 @@ enum WorkspaceTool: Identifiable {
         case .organization: return "organization"
         case .organizationDraft(let rule): return "organizationDraft-\(rule.id)"
         case .aiAssistant: return "aiAssistant"
+        case .agent: return "agent"
         }
     }
 }
@@ -26,6 +27,7 @@ struct WorkspaceLibrary: View {
     let workspace: BrowserWorkspace
     @ViewState private var name = ""
     @ViewState private var duplicate = false
+    @ViewState private var project: ProjectMemory?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -49,11 +51,15 @@ struct WorkspaceLibrary: View {
                     HStack {
                         Text(saved.name)
                         Spacer()
+                        Button("工作区记忆…") {
+                            project = workspace.aiMemory.project(saved.id) ?? ProjectMemory(id: saved.id, name: saved.name)
+                        }
                         Button("打开") {
                             workspace.openWorkspace(saved)
                             workspace.presentedTool = nil
                         }
                     }
+                    .buttonStyle(.borderless)
                 }
             }
             HStack {
@@ -63,6 +69,9 @@ struct WorkspaceLibrary: View {
         }
         .padding(18)
         .frame(width: 470, height: 330)
+        .sheet(item: $project) { item in
+            ProjectMemoryEditor(memory: workspace.aiMemory, project: item) { project = nil }
+        }
         .onAppear { name = workspace.activeBrowser.directoryName }
         .onChange(of: name) { duplicate = false }
     }

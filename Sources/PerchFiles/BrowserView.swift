@@ -63,6 +63,7 @@ struct BrowserView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
             if restoresSession { workspace.saveSession(workspace.snapshot) }
         }
+        .onChange(of: workspace.aiMemory.feedback) { workspace.rerankSearches() }
         .onChange(of: workspace.activeTab.id, initial: true) {
             workspace.refreshClipboard()
         }
@@ -93,6 +94,18 @@ struct BrowserView: View {
         .sheet(item: Binding(get: { workspace.destinationRequest }, set: { workspace.destinationRequest = $0 })) { request in
             TransferDestinationView(request: request, workspace: workspace)
         }
+        .sheet(item: Binding(get: { workspace.projectMemoryRequest }, set: { workspace.projectMemoryRequest = $0 })) { project in
+            ProjectMemoryEditor(memory: workspace.aiMemory, project: project) { workspace.projectMemoryRequest = nil }
+        }
+        .sheet(item: Binding(get: { workspace.workflowRequest }, set: { workspace.workflowRequest = $0 })) { request in
+            FileWorkflowEditor(memory: workspace.aiMemory, draft: request.draft, selectionCount: request.entries.count,
+                               run: request.browser.map { browser in
+                                   { workflow in
+                                       workspace.workflowRequest = nil
+                                       Task { await workspace.runWorkflow(workflow, entries: request.entries, from: browser) }
+                                   }
+                               }) { workspace.workflowRequest = nil }
+        }
         .sheet(item: Binding(get: { workspace.presentedTool }, set: { workspace.presentedTool = $0 }),
                onDismiss: {
                    let action = actionAfterToolDismissal
@@ -102,13 +115,19 @@ struct BrowserView: View {
             switch tool {
             case .workspaces: WorkspaceLibrary(workspace: workspace)
             case .batchRename(let browser, let entries):
-                BatchRenameView(browser: browser, entries: entries) { workspace.presentedTool = nil }
+                BatchRenameView(browser: browser, entries: entries, saveWorkflow: { rule in
+                    dismissTool {
+                        workspace.workflowRequest = FileWorkflowRequest(draft: FileWorkflow(name: "批量重命名", rename: rule),
+                                                                        entries: entries, browser: browser)
+                    }
+                }) { workspace.presentedTool = nil }
             case .compare: FolderCompareView(workspace: workspace)
             case .spotlight: SpotlightSearchView(workspace: workspace)
             case .advancedSearch(let folder): AdvancedSearchView(workspace: workspace, existing: folder)
             case .commands: CommandPalette(workspace: workspace)
             case .remote: RemoteLocationsView(workspace: workspace)
             case .organization: OrganizationView(workspace: workspace)
+            case .agent: AgentTasksView { workspace.presentedTool = nil }
             case .organizationDraft(let rule): OrganizationView(workspace: workspace, draft: rule)
             case .aiAssistant:
                 AIAssistantView(
@@ -397,6 +416,16 @@ struct BrowserView: View {
         }
 
         ToolbarItemGroup(placement: .automatic) {
+            if AgentService.shared.grant != nil {
+                let count = AgentService.shared.pendingCount
+                Button {
+                    AgentService.shared.present()
+                } label: {
+                    Label(count == 0 ? "Agent 任务" : "Agent 任务，\(count) 项待确认",
+                          systemImage: count == 0 ? "tray" : "tray.fill")
+                }
+                .help("Agent 任务")
+            }
             Button("AI 助手", systemImage: "sparkles", action: workspace.openAIAssistant)
                 .help("AI 助手（⌥⌘A）")
             FileViewMenu(model: model, workspace: workspace)
@@ -863,6 +892,9 @@ private struct BrowserPane: View {
                               systemImage: job.state == .conflicts ? "exclamationmark.circle" : "arrow.left.arrow.right")
                     }
                     .buttonStyle(.plain)
+                } else if let workflow = workspace.runningWorkflow {
+                    ProgressView().controlSize(.mini)
+                    Text("正在运行「\(workflow)」…").lineLimit(1)
                 } else if workspace.isTransferring || model.busy {
                     ProgressView().controlSize(.mini)
                     Text("正在处理…")

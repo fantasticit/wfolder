@@ -57,6 +57,8 @@ struct SmartFolder: Codable, Equatable, Identifiable, Sendable {
     var root: URL
     var conditions = SearchConditions()
     var semantics: SearchSemantics?
+    var feedbackContext: SearchMemoryContext? = nil
+    var limitedTo: Set<String>? = nil
 
     @MainActor func results(showHidden: Bool,
                             reportProgress: (@Sendable (FolderSearchProgress) -> Void)? = nil) async throws -> FolderSearchResults {
@@ -85,6 +87,7 @@ struct SmartFolder: Codable, Equatable, Identifiable, Sendable {
             let since = Int(conditions.days).flatMap { Calendar.current.date(byAdding: .day, value: -$0, to: .now) }
             return try FileSystem.search(root, query: conditions.filename, showHidden: showHidden,
                                          recursive: conditions.recursive, includesCandidate: { url in
+                if let limitedTo, !limitedTo.contains(url.standardizedFileURL.path) { return false }
                 if !suffixes.isEmpty && !suffixes.contains(url.pathExtension.lowercased()) { return false }
                 if let since {
                     let date = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate

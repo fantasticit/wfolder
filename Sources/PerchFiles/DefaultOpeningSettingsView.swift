@@ -1,5 +1,6 @@
 import SwiftUI
 import UniformTypeIdentifiers
+import CoreServices
 
 struct DefaultOpeningSettingsView: View {
     @ViewState private var folder = DefaultOpening.Association()
@@ -10,18 +11,81 @@ struct DefaultOpeningSettingsView: View {
     @ViewState private var folderIssue: String?
     @ViewState private var batchResult: DefaultOpening.BatchResult?
 
+    @ViewState private var viewerID: String?
+    @ViewState private var viewerIssue: String?
+    @ViewState private var viewerRestorable = false
+    @ViewState private var folderRestorable = false
+    @ViewState private var folderConfigured: String?
+    private let preferences = FileViewerPreferences()
     private let types = DefaultOpening.documentTypes
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
+            viewerSettings
+            Divider()
             folderSettings
             Divider()
             fileSettings
         }
         .padding(22)
-        .frame(width: 600, height: 460, alignment: .topLeading)
+        .frame(width: 640, height: 640, alignment: .topLeading)
         .onAppear(perform: refresh)
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in refresh() }
+    }
+
+    private var viewerSettings: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("在访达中显示", systemImage: "doc.text.magnifyingglass").font(.headline)
+            HStack {
+                Text("配置应用 · " + viewerName).lineLimit(1)
+                Spacer()
+                if viewerRestorable {
+                    Button("恢复原配置") { updatePreferences { try preferences.restoreViewer() } }
+                }
+                Button("使用 wfolder") {
+                    guard let identifier = wfolder?.bundleID else { return }
+                    updatePreferences {
+                        if let url = wfolder?.url { _ = LSRegisterURL(url as CFURL, true) }
+                        try preferences.setViewer(identifier)
+                    }
+                }
+                .disabled(wfolder?.bundleID == nil || viewerID == wfolder?.bundleID)
+            }
+            if let viewerIssue {
+                Text(viewerIssue).font(.caption).foregroundStyle(.red)
+            }
+            Text("控制其他应用的「在访达中显示」。保存后可能需要重新登录或重启。")
+                .font(.caption).foregroundStyle(.secondary)
+            Button("测试显示文件…", action: testViewer)
+        }
+    }
+
+    private var viewerName: String {
+        guard let viewerID else { return "访达（系统默认）" }
+        return NSWorkspace.shared.urlForApplication(withBundleIdentifier: viewerID)
+            .map(DefaultOpening.Application.init)?.name ?? viewerID
+    }
+
+    private func updatePreferences(_ action: () throws -> Void) {
+        do {
+            try action()
+            viewerIssue = nil
+        } catch {
+            viewerIssue = error.localizedDescription
+        }
+        refresh()
+    }
+
+    private func testViewer() {
+        guard let window = NSApp.keyWindow else { return }
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.prompt = "测试显示"
+        panel.beginSheetModal(for: window) { result in
+            if result == .OK { NSWorkspace.shared.activateFileViewerSelecting(panel.urls) }
+        }
     }
 
     private var folderSettings: some View {
@@ -56,6 +120,22 @@ struct DefaultOpeningSettingsView: View {
                 Text("适用于通过 macOS 打开的普通文件夹。桌面和 Dock 的访达入口由系统管理。")
                     .font(.caption).foregroundStyle(.secondary)
             }
+            HStack {
+                if folderRestorable {
+                    Button("恢复文件夹原配置") { updatePreferences { try preferences.restoreFolder() } }
+                }
+                Button("启用文件夹兼容设置") {
+                    guard let identifier = wfolder?.bundleID else { return }
+                    updatePreferences { try preferences.setFolder(identifier) }
+                }
+                .disabled(wfolder?.bundleID == nil || folderConfigured == wfolder?.bundleID)
+            }
+            Text(folderConfigured == wfolder?.bundleID && folderConfigured != nil
+                 ? "兼容配置已写入。当前实际默认应用以上方检测为准，重新登录后可再次检查。"
+                 : "兼容设置修改当前用户的文件夹打开偏好，保存原配置以便恢复。")
+                .font(.caption).foregroundStyle(.secondary)
+            Button("选取文件夹并在 wfolder 打开…", action: openFolderInWfolder)
+                .disabled(changing != nil || wfolder == nil)
         }
     }
 
@@ -72,6 +152,7 @@ struct DefaultOpeningSettingsView: View {
 
             List(types, id: \.identifier) { type in
                 fileRow(type)
+                    .listRowInsets(EdgeInsets(top: 8, leading: 10, bottom: 8, trailing: 10))
             }
             .listStyle(.inset)
             .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
@@ -139,6 +220,7 @@ struct DefaultOpeningSettingsView: View {
             }
         }
         .padding(.vertical, 2)
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     @ViewBuilder private func destinations(for type: UTType, association: DefaultOpening.Association) -> some View {
@@ -176,6 +258,10 @@ struct DefaultOpeningSettingsView: View {
     }
 
     private func refresh() {
+        viewerID = preferences.viewer
+        viewerRestorable = preferences.canRestoreViewer
+        folderRestorable = preferences.canRestoreFolder
+        folderConfigured = preferences.configuredFolder
         folder = DefaultOpening.association(for: .folder)
         for type in types { fileApplications[type] = DefaultOpening.current(for: type) }
     }
@@ -188,6 +274,24 @@ struct DefaultOpeningSettingsView: View {
         panel.prompt = "选取"
         panel.beginSheetModal(for: window) { result in
             if result == .OK, let url = panel.url { change(to: DefaultOpening.Application(url), for: type) }
+        }
+    }
+
+    private func openFolderInWfolder() {
+        guard let window = NSApp.keyWindow, let app = wfolder else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = true
+        panel.prompt = "在 wfolder 打开"
+        panel.beginSheetModal(for: window) { result in
+            guard result == .OK else { return }
+            let configuration = NSWorkspace.OpenConfiguration()
+            NSWorkspace.shared.open(panel.urls, withApplicationAt: app.url, configuration: configuration) { _, error in
+                if let error {
+                    Task { @MainActor in folderIssue = error.localizedDescription }
+                }
+            }
         }
     }
 

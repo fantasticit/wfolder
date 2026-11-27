@@ -13,6 +13,8 @@ final class BrowserSession {
     var favorites: [URL] { pins.filter(\.isFolder).map(\.url) }
     private var folderViews: [String: FolderViewPreference]
     @ObservationIgnored var searchRoots: ((UUID) -> [URL])?
+    @ObservationIgnored var workspaceIdentity: ((UUID) -> (UUID, String)?)?
+    let aiMemory: AIMemory
     var showHidden = UserDefaults.standard.bool(forKey: "showHidden")
     var showPreview = true
     var isTransferring = false
@@ -35,6 +37,7 @@ final class BrowserSession {
     init(clipboard: NSPasteboard? = nil, defaults: UserDefaults = .standard) {
         self.clipboard = clipboard ?? .general
         storage = WorkspaceStorage(defaults: defaults)
+        aiMemory = defaults === UserDefaults.standard ? .shared : AIMemory(defaults: defaults)
         history = FileHistory(defaults: defaults)
         frequentFiles = FrequentFiles(defaults: defaults)
         stash = storage.stash
@@ -159,6 +162,7 @@ final class BrowserWorkspace {
         var linkedPaneIDs: [UUID] = []
         var proportions: [UUID: CGFloat] = [:]
         var showsQuickAccess = false
+        var namedWorkspaceID: UUID?
 
         init(snapshot: TabSnapshot, session: BrowserSession) {
             var proportions: [UUID: CGFloat] = [:]
@@ -167,6 +171,7 @@ final class BrowserWorkspace {
             self.layout = tree
             self.proportions = proportions
             title = snapshot.title
+            namedWorkspaceID = snapshot.namedWorkspaceID
             comparisonPair = snapshot.comparisonPair
             showsQuickAccess = snapshot.showsQuickAccess == true
             if let pair = comparisonPair, pair.linked,
@@ -180,7 +185,8 @@ final class BrowserWorkspace {
         var snapshot: TabSnapshot {
             TabSnapshot(layout: layout.snapshot(proportions: proportions),
                         activePane: browsers.firstIndex { $0.id == focusedPaneID } ?? 0,
-                        title: title, comparisonPair: comparisonPair, showsQuickAccess: showsQuickAccess ? true : nil)
+                        title: title, comparisonPair: comparisonPair, showsQuickAccess: showsQuickAccess ? true : nil,
+                        namedWorkspaceID: namedWorkspaceID)
         }
 
         init(browser: BrowserModel) {
@@ -242,6 +248,10 @@ final class BrowserWorkspace {
     let transfers = TransferQueue()
     var transferChoice: TransferChoice?
     var destinationRequest: TransferDestinationRequest?
+    var workflowRequest: FileWorkflowRequest?
+    private(set) var runningWorkflow: String?
+    var projectMemoryRequest: ProjectMemory?
+    var aiMemory: AIMemory { session.aiMemory }
     private(set) var recentDestinations: [URL]
     var showsOperations = false
     var operationsTab: FileOperationsTab = .transfers
@@ -282,13 +292,30 @@ final class BrowserWorkspace {
         }
         session.mutationFinished = { [weak self] in self?.advanceTransfers() }
         session.searchRoots = { [weak self] id in self?.searchDirectories(for: id) ?? [] }
+        session.workspaceIdentity = { [weak self] pane in
+            guard let self, let tab = tabs.first(where: { $0.browsers.contains { $0.id == pane } }),
+                  let id = tab.namedWorkspaceID, let saved = namedWorkspaces.first(where: { $0.id == id }) else { return nil }
+            return (id, saved.name)
+        }
+        // Sessions saved before workspace IDs used the saved title.
+        for index in tabs.indices where tabs[index].namedWorkspaceID == nil {
+            if let saved = namedWorkspaces.first(where: { $0.name == tabs[index].title }) {
+                tabs[index].namedWorkspaceID = saved.id
+            }
+        }
     }
 
     var snapshot: SessionSnapshot {
         SessionSnapshot(tabs: tabs.map(\.snapshot), activeTab: activeIndex, showsPreview: session.showPreview)
     }
 
-    func saveSession(_ snapshot: SessionSnapshot) { storage.saveSession(snapshot) }
+    func saveSession(_ snapshot: SessionSnapshot) {
+        storage.saveSession(snapshot)
+        // Only the active tab can contribute the latest layout when a workspace is open twice.
+        if snapshot.tabs.indices.contains(snapshot.activeTab) {
+            aiMemory.rememberLayout(snapshot.tabs[snapshot.activeTab])
+        }
+    }
 
     func openAIAssistant() {
         if assistantPlacement == .sheet {
@@ -317,16 +344,49 @@ final class BrowserWorkspace {
         guard !name.isEmpty, !namedWorkspaces.contains(where: { $0.name.localizedCaseInsensitiveCompare(name) == .orderedSame }) else {
             return false
         }
-        namedWorkspaces.append(NamedWorkspace(id: UUID(), name: name, tab: activeTab.snapshot))
+        let id = UUID()
+        tabs[activeIndex].namedWorkspaceID = id
+        namedWorkspaces.append(NamedWorkspace(id: id, name: name, tab: activeTab.snapshot))
         storage.saveNamed(namedWorkspaces)
         return true
     }
 
+    func reloadNamedWorkspaces() { namedWorkspaces = storage.named }
+
     func openWorkspace(_ saved: NamedWorkspace) {
-        var tab = Tab(snapshot: saved.tab, session: session)
+        let memory = aiMemory.project(saved.id)
+        let layout = memory?.resumesLayout != false ? memory?.recentLayout ?? saved.tab : saved.tab
+        var tab = Tab(snapshot: layout, session: session)
         tab.title = saved.name
+        tab.namedWorkspaceID = saved.id
         tabs.insert(tab, at: activeIndex + 1)
         activeIndex += 1
+    }
+
+    var activeProjectMemory: ProjectMemory? { aiMemory.project(activeTab.namedWorkspaceID) }
+
+    func projectDelivery(for browser: BrowserModel) -> URL? {
+        aiMemory.project(session.workspaceIdentity?(browser.id)?.0)?.delivery
+    }
+
+    func searchRoot(for memory: ProjectMemory) -> URL? {
+        memory.root ?? namedWorkspaces.first(where: { $0.id == memory.id })?.tab.preferredFolder
+    }
+
+    func editProjectMemory(_ saved: NamedWorkspace) {
+        projectMemoryRequest = aiMemory.project(saved.id) ?? ProjectMemory(id: saved.id, name: saved.name)
+    }
+
+    func recordSearchFeedback(_ rating: SearchFeedback.Rating, file: URL, in browser: BrowserModel) {
+        guard let context = browser.searchFeedbackContext else { return }
+        aiMemory.save(SearchFeedback(context: context, file: file, rating: rating))
+        rerankSearches()
+    }
+
+    func rerankSearches() {
+        for browser in tabs.flatMap(\.browsers) where browser.searchFeedbackContext != nil {
+            browser.rerankSearch()
+        }
     }
 
     func resizeSplit(_ id: UUID, ratio: CGFloat) {
@@ -648,6 +708,7 @@ final class BrowserWorkspace {
 
     @discardableResult
     func transfer(_ urls: [URL], into directory: URL, operation: PaneTransferOperation, fromStash: Bool = false,
+                  preparedDestination: TransferFiles.Destination? = nil, expectedSources: [URL: FileStamp]? = nil,
                   onFinish: ((TransferJob) -> Void)? = nil) -> Bool {
         let sources = FileSystem.selectedRoots(urls.filter(\.isFileURL).map(\.standardizedFileURL))
         guard !sources.isEmpty, directory.isFileURL else { return false }
@@ -657,7 +718,9 @@ final class BrowserWorkspace {
         recentDestinations = Array(recentDestinations.prefix(12))
         storage.saveRecentDestinations(recentDestinations)
         transfers.append(PaneTransfer(sources: sources, directory: directory.standardizedFileURL,
-                                      operation: operation, fromStash: fromStash), onFinish: onFinish)
+                                      operation: operation, fromStash: fromStash,
+                                      preparedDestination: preparedDestination,
+                                      expectedSources: expectedSources), onFinish: onFinish)
         advanceTransfers()
         return true
     }
@@ -751,6 +814,86 @@ final class BrowserWorkspace {
     func removeOrganizationRule(_ rule: OrganizationRule) {
         organizationRules.removeAll { $0.id == rule.id }
         storage.saveOrganizationRules(organizationRules)
+    }
+
+    @discardableResult
+    func runWorkflow(_ workflow: FileWorkflow, entries: [FileEntry], from browser: BrowserModel) async -> Bool {
+        guard !browser.isArchivePane, tabs.contains(where: { $0.browsers.contains { $0 === browser } }) else { return false }
+        let files = entries.map(\.url)
+        let delivery = projectDelivery(for: browser)
+        return await executeWorkflow(workflow, fromStash: browser.isStash, prepare: {
+            try FileWorkflowPlan(workflow, files: files, projectDelivery: delivery)
+        }) { result in
+            if let error = result.error {
+                self.activeBrowser.issue = BrowserIssue(title: "流程未完成", message: error)
+            }
+        }
+    }
+
+    struct WorkflowResult {
+        var outputs: [URL] = []
+        var warnings: [String] = []
+        var error: String?
+        var cancelled = false
+    }
+
+    @discardableResult
+    func executeWorkflow(_ workflow: FileWorkflow, fromStash: Bool = false,
+                         prepare: @escaping @Sendable () throws -> FileWorkflowPlan,
+                         onTransfer: (UUID) -> Void = { _ in },
+                         onFinish: @escaping (WorkflowResult) -> Void) async -> Bool {
+        guard !hasFileMutations else {
+            onFinish(WorkflowResult(error: "有其他文件操作正在进行，请稍后重试。"))
+            return false
+        }
+        session.isTransferring = true
+        runningWorkflow = workflow.name
+        defer {
+            runningWorkflow = nil
+            session.isTransferring = false
+            advanceTransfers()
+        }
+        do {
+            let (plan, output, expected) = try await Task.detached(priority: .userInitiated) {
+                let plan = try prepare()
+                let output = plan.run()
+                let expected = Dictionary(uniqueKeysWithValues: output.outputs.compactMap { url in
+                    FileStamp(url).map { (url.standardizedFileURL, $0) }
+                })
+                return (plan, output, expected)
+            }.value
+            let changes = session.updateStash(for: output.renamed.relocations, keepingReferences: true)
+            history.record(.batchRename, count: changes.count, detail: workflow.name, relocations: changes)
+            frequentFiles.relocate(changes)
+            if !changes.isEmpty || output.archive != nil { refreshLocations(plan.sources + output.outputs) }
+            if let issue = output.error {
+                let recovery = changes.isEmpty ? "" : "\n已完成的重命名可以从操作历史撤销。"
+                onFinish(WorkflowResult(outputs: output.renamed.revealed, error: issue + recovery))
+                return false
+            }
+            if let destination = plan.destination, let operation = workflow.transfer.operation {
+                let enqueued = transfer(output.outputs, into: destination, operation: operation,
+                                        fromStash: fromStash && output.archive == nil,
+                                        preparedDestination: plan.preparedDestination, expectedSources: expected) { job in
+                    let warnings = job.warnings + (job.skipped > 0 ? ["跳过 \(job.skipped) 项"] : [])
+                    let errors = job.failures.map { $0.source.lastPathComponent + " · " + $0.message }
+                    let published = output.outputs.compactMap { job.published[$0.standardizedFileURL] }
+                    let local = output.archive.flatMap { FileStamp($0) == nil ? nil : $0 }
+                    onFinish(WorkflowResult(outputs: published, warnings: warnings + (local != nil && published.isEmpty ?
+                                ["ZIP 已生成，可在来源文件夹查看。"] : []),
+                                error: errors.isEmpty ? nil : errors.joined(separator: "\n"),
+                                cancelled: job.state == .cancelled))
+                }
+                if enqueued, let id = transfers.jobs.last?.id { onTransfer(id) }
+                else { onFinish(WorkflowResult(error: "无法将文件加入传输队列。")) }
+                return enqueued
+            }
+            onFinish(WorkflowResult(outputs: output.outputs))
+            return true
+        } catch {
+            onFinish(WorkflowResult(error: error.localizedDescription))
+            return false
+        }
     }
 
     func applyOrganization(_ plan: OrganizationPlan, scope: AIAutomationScope? = nil) async -> FileOperationResult? {

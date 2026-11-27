@@ -135,6 +135,30 @@ struct BrowserFileActions {
             menu.addItem(action("移到废纸篓…", "trash", enabled: canModify) { model.askTrash(items) })
         }
         menu.addItem(.separator())
+        if let entry, let context = model.searchFeedbackContext {
+            let current = workspace.aiMemory.rating(for: entry.url, in: context)
+            let ratings = SearchFeedback.Rating.allCases.map { rating in
+                let item = action(rating == .relevant ? "这就是我要找的" : "这项不相关") {
+                    workspace.recordSearchFeedback(rating, file: entry.url, in: model)
+                }
+                item.state = current == rating ? .on : .off
+                return item
+            }
+            menu.addItem(submenu("搜索反馈", icon: "magnifyingglass", items: ratings))
+        }
+        if !model.isArchivePane {
+            var workflows = workspace.aiMemory.workflows.map { workflow in
+                action(workflow.name, enabled: !model.busy && (!workflow.usesProjectDelivery ||
+                    workspace.projectDelivery(for: model) != nil)) {
+                    Task { await workspace.runWorkflow(workflow, entries: items, from: model) }
+                }
+            }
+            if !workflows.isEmpty { workflows.append(.separator()) }
+            workflows.append(action("新建流程…") {
+                workspace.workflowRequest = FileWorkflowRequest(draft: FileWorkflow(), entries: items, browser: model)
+            })
+            menu.addItem(submenu("文件流程", icon: "bolt", items: workflows))
+        }
         menu.addItem(submenu("更多操作", icon: "ellipsis", items: moreActions(for: items, single: entry)))
         return menu
     }
@@ -213,6 +237,10 @@ struct BrowserFileActions {
                 }
             }
             options.append(action("压缩为 ZIP", "archivebox", enabled: canModify) { model.compress(items) })
+            options.append(action("将压缩保存为流程…", "bolt", enabled: canModify) {
+                workspace.workflowRequest = FileWorkflowRequest(draft: FileWorkflow(name: "压缩为 ZIP", compresses: true),
+                                                                entries: items, browser: model)
+            })
         }
         options.append(action("全选当前结果") { model.selectAllResults() })
         options.append(action("反向选择") { model.invertSelection() })

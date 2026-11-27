@@ -16,6 +16,15 @@ struct PaneSnapshot: Codable, Equatable {
 indirect enum LayoutSnapshot: Codable, Equatable {
     case pane(PaneSnapshot)
     case split(PaneSplitDirection, Double, LayoutSnapshot, LayoutSnapshot)
+
+    var folderPaths: [URL?] {
+        switch self {
+        case .pane(let pane):
+            return [pane.isStash == true || pane.archiveURL != nil ? nil : pane.smartFolder?.root ?? pane.directory]
+        case .split(_, _, let left, let right):
+            return left.folderPaths + right.folderPaths
+        }
+    }
 }
 
 struct TabSnapshot: Codable, Equatable {
@@ -24,6 +33,13 @@ struct TabSnapshot: Codable, Equatable {
     let title: String?
     var comparisonPair: DirectoryPair? = nil
     var showsQuickAccess: Bool? = nil
+    var namedWorkspaceID: UUID? = nil
+
+    var preferredFolder: URL? {
+        let directories = layout.folderPaths
+        let active = directories.indices.contains(activePane) ? directories[activePane] : nil
+        return active ?? directories.compactMap { $0 }.first
+    }
 }
 
 struct SessionSnapshot: Codable, Equatable {
@@ -62,6 +78,33 @@ struct WorkspaceStorage {
     var recentDestinations: [URL] { read([URL].self, key: "wfolder.recentDestinations") ?? [] }
     var folderViews: [String: FolderViewPreference] {
         read([String: FolderViewPreference].self, key: "wfolder.folderViews") ?? [:]
+    }
+
+    func saveFolderWorkspace(_ directory: URL) -> NamedWorkspace {
+        var values = named
+        if let existing = values.first(where: { saved in
+            guard case .pane(let pane) = saved.tab.layout, pane.isStash != true, pane.smartFolder == nil,
+                  pane.archiveURL == nil else { return false }
+            return pane.directory.standardizedFileURL.path == directory.standardizedFileURL.path
+        }) {
+            return existing
+        }
+        let stem = directory.lastPathComponent.isEmpty || directory.path == "/" ? "磁盘" : directory.lastPathComponent
+        let names = Set(values.map { $0.name.folding(options: .caseInsensitive, locale: .current) })
+        var name = stem
+        var number = 2
+        while names.contains(name.folding(options: .caseInsensitive, locale: .current)) {
+            name = "\(stem) \(number)"
+            number += 1
+        }
+        let id = UUID()
+        let pane = PaneSnapshot(directory: directory, viewMode: .details, grouping: .none, sortColumn: .name,
+                                ascending: true)
+        let tab = TabSnapshot(layout: .pane(pane), activePane: 0, title: name, namedWorkspaceID: id)
+        let workspace = NamedWorkspace(id: id, name: name, tab: tab)
+        values.append(workspace)
+        saveNamed(values)
+        return workspace
     }
 
     func saveSession(_ session: SessionSnapshot) { write(session, key: sessionKey) }

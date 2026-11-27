@@ -100,6 +100,12 @@ final class AIConversation {
                     finish(turn.id, with: .answer(result.text))
                     return
                 }
+                if intent.action == .answer {
+                    let text = AIClient.visibleReply(intent.message ?? "")
+                    guard !text.isEmpty else { throw AIServiceError.response }
+                    finish(turn.id, with: .answer(text))
+                    return
+                }
                 if intent.action == .searchResults {
                     if let previous = latestSearch(before: turn.id) {
                         finishSearch(turn.id, summary: previous)
@@ -110,7 +116,7 @@ final class AIConversation {
                 }
                 guard context.matches(workspace) else { throw AIActionError.contextChanged }
                 if intent.action == .search {
-                    try await search(intent, in: workspace, context: context, turn: turn.id)
+                    try await search(intent, in: workspace, context: context, turn: turn)
                     return
                 }
                 let proposal = try await intent.proposal(in: workspace, context: context)
@@ -197,14 +203,17 @@ final class AIConversation {
             switch turn.reply {
             case .interrupted: reply = .interrupted
             case .stopped: reply = .stopped
-            case .answer(let text): reply = .answer(text)
+            case .answer(let text):
+                let visible = AIClient.visibleReply(text)
+                reply = visible.isEmpty ? .failed("这条回复没有保存可显示的结果。可以重新发送搜索。") : .answer(visible)
             case .failed(let text): reply = .failed(text)
             case .searchResult(let summary): reply = .searchResult(summary)
             case .organizationResult(let title, let details): reply = .organizationResult(title: title, details: details)
             case .proposal(let title, let details): reply = .previousProposal(title: title, details: details)
             case .archived(let title, let details, let status): reply = .archived(title: title, details: details, status: status)
             }
-            return Turn(id: turn.id, prompt: turn.prompt, preface: turn.preface, reply: reply)
+            let preface = turn.preface.map(AIClient.visibleReply).flatMap { $0.isEmpty ? nil : $0 }
+            return Turn(id: turn.id, prompt: turn.prompt, preface: preface, reply: reply)
         }
     }
 
@@ -238,14 +247,14 @@ final class AIConversation {
     }
 
     private func search(_ intent: AIIntent, in workspace: BrowserWorkspace, context: AIFolderContext,
-                        turn: UUID) async throws {
+                        turn: Turn) async throws {
         turns[turns.count - 1].reply = .searching
         partialText = ""
         scrollRevision += 1
-        let folder = try await intent.searchFolder(in: workspace, context: context)
+        let folder = try await intent.searchFolder(in: workspace, context: context, prompt: turn.prompt)
         guard context.matches(workspace) else { throw AIActionError.contextChanged }
         let summary = try await searchSummary(folder, in: workspace)
-        finishSearch(turn, summary: summary)
+        finishSearch(turn.id, summary: summary)
     }
 
     func rerunSearch(_ original: SmartFolder, at directory: URL, in workspace: BrowserWorkspace) {
@@ -253,6 +262,7 @@ final class AIConversation {
         var folder = original
         folder.id = UUID()
         folder.root = directory
+        folder.feedbackContext?.root = directory
         let turn = Turn(prompt: "在所选目录重新搜索「\(folder.name)」", reply: .searching)
         archiveProposal(status: "已被后续消息替代")
         turns.append(turn)

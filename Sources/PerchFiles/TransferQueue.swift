@@ -27,12 +27,21 @@ private struct TransferPreparation: Sendable {
     var failures: [FileOperationResult.Failure] = []
 
     init(_ request: PaneTransfer) throws {
-        destination = try TransferFiles.Destination(request.directory)
+        if let prepared = request.preparedDestination {
+            try prepared.validate()
+            destination = prepared
+        } else {
+            destination = try TransferFiles.Destination(request.directory)
+        }
         var incoming: [String: TransferItem] = [:]
         for url in request.sources {
             try Task.checkCancellation()
             guard let stamp = FileStamp(url) else {
                 failures.append(.init(source: url, message: "源项目不存在或无法读取。"))
+                continue
+            }
+            if let expected = request.expectedSources, expected[url] != stamp {
+                failures.append(.init(source: url, message: "源项目已变更，请检查后重试。"))
                 continue
             }
             let item = TransferItem(url: url, stamp: stamp)
@@ -76,6 +85,7 @@ final class TransferJob: Identifiable {
     var failures: [FileOperationResult.Failure] = []
     var warnings: [String] = []
     var completed: Set<URL> = []
+    var published: [URL: URL] = [:]
     var skipped = 0
     var moved: [FileRelocation] = []
     var backups: [FileRelocation] = []
@@ -210,6 +220,7 @@ final class TransferQueue {
                                decision: reviewed == nil ? nil : decision, reviewed: reviewed, meter: meter)
             }
             job.completed.insert(item.url)
+            job.published[item.url] = outcome.url
             written.insert(destination.key(outcome.url.lastPathComponent))
             if let warning = outcome.warning { job.warnings.append(warning) }
             if operation == .move, outcome.url.path != item.url.path {

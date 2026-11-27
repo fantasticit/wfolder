@@ -83,7 +83,30 @@ struct QuickAccessView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("工作区").font(.headline)
             ForEach(workspace.namedWorkspaces) { saved in
-                row(saved.name, icon: "rectangle.split.2x1", subtitle: nil) { workspace.openWorkspace(saved) }
+                let memory = workspace.aiMemory.project(saved.id)
+                HStack {
+                    row(saved.name, icon: "rectangle.split.2x1", subtitle: memory?.root?.path) { workspace.openWorkspace(saved) }
+                    if memory?.recentLayout != nil {
+                        Button("继续上次工作") { workspace.openWorkspace(saved) }.controlSize(.small)
+                    }
+                    Button("工作区记忆…") { workspace.editProjectMemory(saved) }
+                        .controlSize(.small)
+                }
+                if let memory, let root = workspace.searchRoot(for: memory) {
+                    let prefix = root.path == "/" ? "/" : root.path + "/"
+                    ForEach(workspace.frequentFiles.recentItems.filter { $0.file.url.path.hasPrefix(prefix) }.prefix(3)) { item in
+                        Button {
+                            workspace.openWorkspace(saved)
+                            workspace.openQuickAccessItem(item.file.url)
+                        } label: {
+                            Label(item.file.filename, systemImage: "clock").lineLimit(1).truncationMode(.middle)
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                        .padding(.leading, 16)
+                        .help(item.file.url.path)
+                    }
+                }
             }
         }
     }

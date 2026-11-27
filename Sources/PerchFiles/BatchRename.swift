@@ -141,6 +141,7 @@ private enum BatchRenameError: LocalizedError {
 struct BatchRenameView: View {
     let browser: BrowserModel
     let entries: [FileEntry]
+    var saveWorkflow: ((BatchRenameRule) -> Void)? = nil
     let close: () -> Void
     @ViewState private var rule = BatchRenameRule()
     @ViewState private var plan: BatchRenamePlan?
@@ -186,6 +187,10 @@ struct BatchRenameView: View {
             HStack {
                 Spacer()
                 Button("取消", action: close).keyboardShortcut(.cancelAction)
+                if let saveWorkflow {
+                    Button("保存为流程…") { saveWorkflow(rule) }
+                        .disabled(plan?.canApply != true || checkedRule != rule)
+                }
                 Button("应用重命名") {
                     browser.batchRename(entries, rule: rule)
                     close()

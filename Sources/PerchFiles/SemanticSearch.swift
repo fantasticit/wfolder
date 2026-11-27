@@ -4,6 +4,25 @@ import UniformTypeIdentifiers
 struct SearchSemantics: Codable, Equatable, Sendable {
     let concepts: [[String]]
 
+    static func documentTopic(filename: String, requestedBy prompt: String) -> [String]? {
+        let phrase = filename.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !phrase.isEmpty, phrase.count <= 64, prompt.localizedStandardContains(phrase),
+              prompt.range(of: #"文件名|名称包含|叫做|名为|['"‘’“”「」『』]|(?i:\b(?:file\s*name|named|called)\b)"#,
+                           options: .regularExpression) == nil,
+              let suffix = phrase.range(of: #"(?:文档|\s+(?:documents?|docs?))$"#,
+                                        options: [.regularExpression, .caseInsensitive]) else { return nil }
+        let topic = phrase[..<suffix.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !topic.isEmpty, topic.range(of: #"[./\\]"#, options: .regularExpression) == nil,
+              topic.unicodeScalars.contains(where: CharacterSet.letters.contains) else { return nil }
+        let architecture = ["架构", "架构设计", "系统设计", "architecture", "architecture design",
+                            "architectural design", "system design"]
+        if architecture.contains(topic.lowercased()) {
+            return ["架构", "系统设计", "技术方案", "architecture", "system design",
+                    "technical design", "tech design", "design spec"]
+        }
+        return [topic]
+    }
+
     @MainActor func indexedMatches(in root: URL) async throws -> [Set<String>] {
         let queries = concepts.map { aliases in
             let query = SpotlightSearch()
